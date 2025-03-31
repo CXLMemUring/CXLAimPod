@@ -1,5 +1,6 @@
 #include "kvcache.hpp"
 #include <Python.h>
+#include <iostream>
 #include <stdexcept>
 #include <torch/torch.h>
 
@@ -21,6 +22,7 @@ public:
     // Import cpuinfer_ext module
     PyObject *module = PyImport_ImportModule("cpuinfer_ext");
     if (!module) {
+      PyErr_Print(); // Print Python error details
       throw std::runtime_error("Failed to import cpuinfer_ext module");
     }
 
@@ -28,77 +30,181 @@ public:
     PyObject *kvcache_module = PyObject_GetAttrString(module, "kvcache");
     if (!kvcache_module) {
       Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
       throw std::runtime_error("Failed to get kvcache submodule");
+    }
+
+    // Get the enum classes
+    PyObject *anchor_type_enum =
+        PyObject_GetAttrString(kvcache_module, "AnchorType");
+    PyObject *ggml_type_enum =
+        PyObject_GetAttrString(kvcache_module, "ggml_type");
+    PyObject *retrieval_type_enum =
+        PyObject_GetAttrString(kvcache_module, "RetrievalType");
+
+    if (!anchor_type_enum || !ggml_type_enum || !retrieval_type_enum) {
+      Py_XDECREF(anchor_type_enum);
+      Py_XDECREF(ggml_type_enum);
+      Py_XDECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to get enum classes");
+    }
+
+    // Get the enum values
+    PyObject *fixed_anchor = PyObject_GetAttrString(anchor_type_enum, "FIXED");
+    PyObject *fp16_type = PyObject_GetAttrString(ggml_type_enum, "FP16");
+    PyObject *layer_retrieval =
+        PyObject_GetAttrString(retrieval_type_enum, "LAYER");
+
+    if (!fixed_anchor || !fp16_type || !layer_retrieval) {
+      Py_XDECREF(fixed_anchor);
+      Py_XDECREF(fp16_type);
+      Py_XDECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to get enum values");
+    }
+
+    // Get the KVCacheConfig class
+    PyObject *config_class =
+        PyObject_GetAttrString(kvcache_module, "KVCacheConfig");
+    if (!config_class) {
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to get KVCacheConfig class");
+    }
+
+    // Create KVCacheConfig object
+    PyObject *config_args = PyTuple_New(15);
+    if (!config_args) {
+      Py_DECREF(config_class);
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to create config arguments tuple");
+    }
+
+    // Set config parameters in the tuple
+    PyTuple_SetItem(config_args, 0, PyLong_FromLong(config.layer_num));
+    PyTuple_SetItem(config_args, 1, PyLong_FromLong(config.kv_head_num));
+    PyTuple_SetItem(config_args, 2, PyLong_FromLong(config.q_head_num));
+    PyTuple_SetItem(config_args, 3, PyLong_FromLong(config.head_dim));
+    PyTuple_SetItem(config_args, 4, PyLong_FromLong(config.block_len));
+    PyTuple_SetItem(config_args, 5, PyLong_FromLong(config.anchor_num));
+    PyTuple_SetItem(config_args, 6, fixed_anchor);
+    PyTuple_SetItem(config_args, 7, fp16_type);
+    PyTuple_SetItem(config_args, 8, layer_retrieval);
+    PyTuple_SetItem(config_args, 9, PyLong_FromLong(config.layer_step));
+    PyTuple_SetItem(config_args, 10, PyLong_FromLong(config.token_step));
+    PyTuple_SetItem(config_args, 11, PyLong_FromLong(config.layer_offset));
+    PyTuple_SetItem(config_args, 12, PyLong_FromLong(config.max_block_num));
+    PyTuple_SetItem(config_args, 13, PyLong_FromLong(config.max_batch_size));
+    PyTuple_SetItem(config_args, 14, PyLong_FromLong(config.max_thread_num));
+
+    // Create KVCacheConfig instance
+    PyObject *config_obj = PyObject_Call(config_class, config_args, nullptr);
+    if (!config_obj) {
+      Py_DECREF(config_args);
+      Py_DECREF(config_class);
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to create KVCacheConfig instance");
     }
 
     // Get the KVCache class
     PyObject *kvcache_class = PyObject_GetAttrString(kvcache_module, "KVCache");
     if (!kvcache_class) {
+      Py_DECREF(config_obj);
+      Py_DECREF(config_args);
+      Py_DECREF(config_class);
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
       Py_DECREF(kvcache_module);
       Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
       throw std::runtime_error("Failed to get KVCache class");
     }
 
-    // Create KVCacheConfig object
-    PyObject *config_dict = PyDict_New();
-    PyDict_SetItemString(config_dict, "layer_num",
-                         PyLong_FromLong(config.layer_num));
-    PyDict_SetItemString(config_dict, "kv_head_num",
-                         PyLong_FromLong(config.kv_head_num));
-    PyDict_SetItemString(config_dict, "q_head_num",
-                         PyLong_FromLong(config.q_head_num));
-    PyDict_SetItemString(config_dict, "head_dim",
-                         PyLong_FromLong(config.head_dim));
-    PyDict_SetItemString(config_dict, "block_len",
-                         PyLong_FromLong(config.block_len));
-    PyDict_SetItemString(config_dict, "anchor_num",
-                         PyLong_FromLong(config.anchor_num));
-    PyDict_SetItemString(
-        config_dict, "anchor_type",
-        PyUnicode_FromString(
-            config.anchor_type == AnchorType::FIXED        ? "FIXED"
-            : config.anchor_type == AnchorType::QUEST      ? "QUEST"
-            : config.anchor_type == AnchorType::DYNAMIC    ? "DYNAMIC"
-            : config.anchor_type == AnchorType::BLOCK_MEAN ? "BLOCK_MEAN"
-                                                           : "BLOCK_MAX"));
-    PyDict_SetItemString(
-        config_dict, "kv_type",
-        PyUnicode_FromString(config.kv_type == GGMLType::FP16   ? "FP16"
-                             : config.kv_type == GGMLType::FP32 ? "FP32"
-                             : config.kv_type == GGMLType::Q4_0 ? "Q4_0"
-                                                                : "Q8_0"));
-    PyDict_SetItemString(
-        config_dict, "retrieval_type",
-        PyUnicode_FromString(
-            config.retrieval_type == RetrievalType::LAYER   ? "LAYER"
-            : config.retrieval_type == RetrievalType::QHEAD ? "QHEAD"
-                                                            : "KVHEAD"));
-    PyDict_SetItemString(config_dict, "layer_step",
-                         PyLong_FromLong(config.layer_step));
-    PyDict_SetItemString(config_dict, "token_step",
-                         PyLong_FromLong(config.token_step));
-    PyDict_SetItemString(config_dict, "layer_offset",
-                         PyLong_FromLong(config.layer_offset));
-    PyDict_SetItemString(config_dict, "max_block_num",
-                         PyLong_FromLong(config.max_block_num));
-    PyDict_SetItemString(config_dict, "max_batch_size",
-                         PyLong_FromLong(config.max_batch_size));
-    PyDict_SetItemString(config_dict, "max_thread_num",
-                         PyLong_FromLong(config.max_thread_num));
-
-    // Create KVCache instance
-    kvcache_obj = PyObject_Call(kvcache_class, PyTuple_New(0), config_dict);
-    if (!kvcache_obj) {
-      Py_DECREF(config_dict);
+    // Create KVCache instance with the config object
+    PyObject *kvcache_args = PyTuple_New(1);
+    if (!kvcache_args) {
       Py_DECREF(kvcache_class);
+      Py_DECREF(config_obj);
+      Py_DECREF(config_args);
+      Py_DECREF(config_class);
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
       Py_DECREF(kvcache_module);
       Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
+      throw std::runtime_error("Failed to create KVCache arguments tuple");
+    }
+
+    PyTuple_SetItem(kvcache_args, 0, config_obj);
+
+    kvcache_obj = PyObject_Call(kvcache_class, kvcache_args, nullptr);
+    if (!kvcache_obj) {
+      Py_DECREF(kvcache_args);
+      Py_DECREF(kvcache_class);
+      Py_DECREF(config_args);
+      Py_DECREF(config_class);
+      Py_DECREF(fixed_anchor);
+      Py_DECREF(fp16_type);
+      Py_DECREF(layer_retrieval);
+      Py_DECREF(anchor_type_enum);
+      Py_DECREF(ggml_type_enum);
+      Py_DECREF(retrieval_type_enum);
+      Py_DECREF(kvcache_module);
+      Py_DECREF(module);
+      PyErr_Print(); // Print Python error details
       throw std::runtime_error("Failed to create KVCache instance");
     }
 
     // Cleanup
-    Py_DECREF(config_dict);
+    Py_DECREF(kvcache_args);
     Py_DECREF(kvcache_class);
+    Py_DECREF(config_args);
+    Py_DECREF(config_class);
+    Py_DECREF(fixed_anchor);
+    Py_DECREF(fp16_type);
+    Py_DECREF(layer_retrieval);
+    Py_DECREF(anchor_type_enum);
+    Py_DECREF(ggml_type_enum);
+    Py_DECREF(retrieval_type_enum);
     Py_DECREF(kvcache_module);
     Py_DECREF(module);
   }
