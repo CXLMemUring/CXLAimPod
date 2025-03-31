@@ -29,57 +29,56 @@
 #include "llama.cpp/ggml-impl.h"
 
 class CPUInfer {
-   public:
-    CPUInfer(int thread_num) {
-        backend_ = new Backend(thread_num - 1);
-        task_queue_ = new TaskQueue();
-        for (int i = 0; i < (1 << 16); ++i) {
-            ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
-        }
+public:
+  CPUInfer(int thread_num) {
+    backend_ = new Backend(thread_num - 1);
+    task_queue_ = new TaskQueue();
+    for (int i = 0; i < (1 << 16); ++i) {
+      ggml_table_f32_f16[i] = GGML_COMPUTE_FP16_TO_FP32(i);
     }
+  }
 
-    ~CPUInfer() {
-        delete backend_;
-        delete task_queue_;
-    }
+  ~CPUInfer() {
+    delete backend_;
+    delete task_queue_;
+  }
 
-    template <typename Func, typename Obj, typename... Args>
-    void enqueue(Func f, Obj* obj, Args... args) {
-        task_queue_->enqueue([=]() {
-            std::invoke(f, *obj, args..., backend_);
-        });
-    }
+  template <typename Func, typename Obj, typename... Args>
+  void enqueue(Func f, Obj *obj, Args... args) {
+    task_queue_->enqueue([=]() { std::invoke(f, *obj, args..., backend_); });
+  }
 
-    void submit(std::pair<intptr_t, intptr_t> params) {
-        void (*func)(void*) = (void (*)(void*))params.first;
-        void* args = (void*)params.second;
-        *((CPUInfer**)args) = this;
-        func(args);
-    }
+  void submit(std::pair<intptr_t, intptr_t> params) {
+    void (*func)(void *) = (void (*)(void *))params.first;
+    void *args = (void *)params.second;
+    *((CPUInfer **)args) = this;
+    func(args);
+  }
 
-    void sync() {
-        task_queue_->sync();
-    }
+  void sync() { task_queue_->sync(); }
 
-    void submit_with_cuda_stream(intptr_t user_cuda_stream, std::pair<intptr_t, intptr_t> params) {
-        void (*func)(void*) = (void (*)(void*))params.first;
-        void* args = (void*)params.second;
-        *((CPUInfer**)args) = this;
-        cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func, args);
-    }
+  void submit_with_cuda_stream(intptr_t user_cuda_stream,
+                               std::pair<intptr_t, intptr_t> params) {
+    void (*func)(void *) = (void (*)(void *))params.first;
+    void *args = (void *)params.second;
+    *((CPUInfer **)args) = this;
+    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)func,
+                       args);
+  }
 
-    static void sync_(void* cpu_infer_ptr) {
-        CPUInfer* cpuinfer = (CPUInfer*)cpu_infer_ptr;
-        cpuinfer->sync();
-    }
+  static void sync_(void *cpu_infer_ptr) {
+    CPUInfer *cpuinfer = (CPUInfer *)cpu_infer_ptr;
+    cpuinfer->sync();
+  }
 
-    void sync_with_cuda_stream(intptr_t user_cuda_stream) {
-        cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_, (void*)this);
-    }
+  void sync_with_cuda_stream(intptr_t user_cuda_stream) {
+    cudaLaunchHostFunc((cudaStream_t)user_cuda_stream, (cudaHostFn_t)&sync_,
+                       (void *)this);
+  }
 
-   public:
-    Backend* backend_;
-    TaskQueue* task_queue_;
+public:
+  Backend *backend_;
+  TaskQueue *task_queue_;
 };
 
 #endif
