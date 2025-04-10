@@ -9,7 +9,7 @@ enable_testing()
 
 # Find Python
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0 -g")
 # Get PyTorch paths using Python
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import torch; print(torch.__path__[0])"

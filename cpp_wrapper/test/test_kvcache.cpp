@@ -50,13 +50,13 @@ int main() {
     std::cout << "Creating test tensors..." << std::endl;
     auto q_in = torch::randn(
         {1, 1, kvconfig.q_head_num, kvconfig.head_dim},
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
     auto output = torch::zeros(
         {1, 1, kvconfig.q_head_num, kvconfig.head_dim},
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat16));
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat16));
     auto attn_lse = torch::zeros(
         {1, 1, kvconfig.q_head_num},
-        torch::TensorOptions().device(torch::kCUDA).dtype(torch::kFloat32));
+        torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat32));
     std::cout << "Test tensors created successfully" << std::endl;
 
     // Test attention operation
