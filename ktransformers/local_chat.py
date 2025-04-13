@@ -81,14 +81,7 @@ def local_chat(
     with torch.device("meta"):
         if config.architectures[0] in custom_models:
             print("using custom modeling_xxx.py.")
-            if (
-                "Qwen2Moe" in config.architectures[0]
-            ):  # Qwen2Moe must use flash_attention_2 to avoid overflow.
-                config._attn_implementation = "flash_attention_2"
-            if "Llama" in config.architectures[0]:
-                config._attn_implementation = "eager"
-            if "Mixtral" in config.architectures[0]:
-                config._attn_implementation = "flash_attention_2"
+            config._attn_implementation = "eager"
 
             model = custom_models[config.architectures[0]](config)
         else:

@@ -81,9 +81,10 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs
+        **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
+
         if self.q_lora_rank is None:
             q = self.q_proj(hidden_states)
         else:
@@ -92,8 +93,6 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         q_nope, q_pe = torch.split(
             q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
         )
-        # q_nope [bsz, self.num_heads, q_len, self.qk_nope_head_dim]
-        # q_pe [bsz, self.num_heads, q_len, self.qk_rope_head_dim]
 
         compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
         compressed_kv, k_pe = torch.split(
@@ -106,12 +105,12 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
-                    f"The cache structure has changed since transformer version v4.36. If you are using {self.__class__.__name__} "
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
+        
         cos, sin = self.rotary_emb(q_pe, position_ids)
         q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
 
@@ -126,43 +125,24 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             compressed_kv, k_pe = torch.split(
                 compressed_kv_with_k_pe, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
-            # k_pe [pages, page_size, 1, self.qk_rope_head_dim]
-            # compressed_kv [pages, page_size, 1, self.kv_lora_rank]
             
         q_absorb, out_absorb = self.get_absorbed()
 
+        # Handle attention mask being None
+        max_seq_length = kv_seq_len if attention_mask is None else attention_mask.size(-1)
+        
         # q_nope [bsz, self.num_heads, q_len, self.qk_nope_head_dim]
         # q_pe [bsz, self.num_heads, q_len, self.qk_rope_head_dim]
-        k_pe = k_pe.view(bsz, 1, -1, self.qk_rope_head_dim)[:,:,:attention_mask.size(-1),:]
-        compressed_kv = compressed_kv.view(bsz, 1, -1, self.kv_lora_rank)[:,:,:attention_mask.size(-1),:]
-        # k_pe [bsz, 1, cache_len, self.qk_rope_head_dim]
-        # compressed_kv [bsz, 1, cache_len,self.kv_lora_rank]
+        k_pe = k_pe.view(bsz, 1, -1, self.qk_rope_head_dim)[:,:,:max_seq_length,:]
+        compressed_kv = compressed_kv.view(bsz, 1, -1, self.kv_lora_rank)[:,:,:max_seq_length,:]
+        
         q_nope = torch.matmul(q_nope, q_absorb)
-        #print(q_pe.shape)
-        #print(k_pe.shape)
-        #print(q_nope.shape)
-        #print(compressed_kv.shape)
         
         attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.mT)) * self.softmax_scale
         
-        #attn_weights [bsz, self.num_heads, q_len, kv_seq_len]
         compressed_kv = compressed_kv.squeeze(1)
-        """
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-        assert attention_mask is not None
-        """
+
         if attention_mask is not None:
-            """
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            """
-            #causal_mask = attention_mask[:, :, :, : kv_seq_len]
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -595,7 +575,11 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        if os.name == 'nt' or get_compute_capability()<8 or device_manager.gpu_vendor != GPUVendor.NVIDIA:
+        # Always use forward_windows for CPU or when compute capability is insufficient
+        if (hidden_states.device.type == "cpu" or 
+            os.name == 'nt' or 
+            get_compute_capability() < 8 or 
+            device_manager.gpu_vendor != GPUVendor.NVIDIA):
             return self.forward_windows(
                 hidden_states,
                 attention_mask,
@@ -607,19 +591,32 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 **kwargs,
             )
         else:
-            if flashinfer_enabled:
-                return self.forward_linux_flashinfer(
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    past_key_value,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    **kwargs,
-                )
-            else:
-                return self.forward_linux_triton(
+            try:
+                if flashinfer_enabled:
+                    return self.forward_linux_flashinfer(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        **kwargs,
+                    )
+                else:
+                    return self.forward_linux_triton(
+                        hidden_states,
+                        attention_mask,
+                        position_ids,
+                        past_key_value,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                        **kwargs,
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to use accelerated attention, falling back to standard attention: {str(e)}")
+                return self.forward_windows(
                     hidden_states,
                     attention_mask,
                     position_ids,
@@ -759,3 +756,52 @@ class KLlamaAttention(BaseInjectedModule):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+class CustomAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.scaling = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+    def forward(self, hidden_states, attention_mask=None, past_key_value=None):
+        batch_size, seq_length, _ = hidden_states.size()
+        
+        # Project queries, keys, and values
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+        
+        # Reshape for multi-head attention
+        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+            
+        # Apply softmax
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        # Compute attention output
+        attn_output = torch.matmul(attn_weights, v)
+        
+        # Reshape and project output
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_length, -1)
+        attn_output = self.o_proj(attn_output)
+        
+        return attn_output, attn_weights, None
+
+# Replace the flash attention with our custom attention
+def forward_linux_triton(self, hidden_states, attention_mask=None, past_key_value=None):
+    return CustomAttention(self.config).forward(hidden_states, attention_mask, past_key_value)

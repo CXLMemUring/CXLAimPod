@@ -129,7 +129,7 @@ class KExpertsCPU(KExpertsBase):
         n_routed_experts: int,
         orig_module: nn.Module = None,
         device: str = "cpu",
-        out_device: str = "cuda", # this device mean which device the output should on. TODO: support cpu.
+        out_device: str = "cpu", # this device mean which device the output should on. TODO: support cpu.
         **kwargs
     ):
         super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
@@ -196,10 +196,29 @@ class KExpertsCPU(KExpertsBase):
             KExpertsCPU.output_cpu = torch.zeros((self.config.hidden_size), device="cpu", pin_memory=True, dtype=torch.bfloat16)
             
     def submit_for_one_decode(self, input_tensor, expert_ids, weights):
+        # Handle the case where input is [hidden_size] or [1, hidden_size]
+        if input_tensor.dim() == 2:
+            input_tensor = input_tensor.squeeze(0)
+        
+        # Handle expert_ids shape
+        expert_ids_reshaped = expert_ids.squeeze(0) if expert_ids.dim() > 1 else expert_ids
+        weights_reshaped = weights.squeeze(0) if weights.dim() > 1 else weights
+        
         KExpertsCPU.input_tensor_cpu.copy_(input_tensor, non_blocking=True)
-        KExpertsCPU.expert_ids_cpu.copy_(expert_ids, non_blocking=True)
-        KExpertsCPU.weights_cpu.copy_(weights, non_blocking=True)
-        self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream, self.moe.forward(1, expert_ids.size(0), KExpertsCPU.expert_ids_cpu.data_ptr(), KExpertsCPU.weights_cpu.data_ptr(), KExpertsCPU.input_tensor_cpu.data_ptr(), KExpertsCPU.output_cpu.data_ptr()))
+        KExpertsCPU.expert_ids_cpu.copy_(expert_ids_reshaped, non_blocking=True)
+        KExpertsCPU.weights_cpu.copy_(weights_reshaped, non_blocking=True)
+        
+        self.cpu_infer.submit_with_cuda_stream(
+            torch.cuda.current_stream(self.out_device).cuda_stream,
+            self.moe.forward(
+                1,
+                expert_ids_reshaped.size(0),
+                KExpertsCPU.expert_ids_cpu.data_ptr(),
+                KExpertsCPU.weights_cpu.data_ptr(),
+                KExpertsCPU.input_tensor_cpu.data_ptr(),
+                KExpertsCPU.output_cpu.data_ptr()
+            )
+        )
         
     def sync_for_one_decode(self):
         self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream)
@@ -208,23 +227,49 @@ class KExpertsCPU(KExpertsBase):
 
     def forward(self, input_tensor, expert_ids, weights):
         # generate, capture and run cuda graph
-        # print(expert_ids)
-        if input_tensor.size(0)==1 and torch.cuda.is_current_stream_capturing():
-            # TODO: this branch is unreachable, but the shape of input_tensor([1,hidden_size]) and input_tensor_cpu([hidden_size]) is not compatible
-            #print("capturing experts")
-            KExpertsCPU.input_tensor_cpu.copy_(input_tensor, non_blocking=True)
-            KExpertsCPU.expert_ids_cpu.copy_(expert_ids, non_blocking=True)
-            KExpertsCPU.weights_cpu.copy_(weights, non_blocking=True)
-            self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream().cuda_stream, self.moe.forward(1, expert_ids.size(1), KExpertsCPU.expert_ids_cpu.data_ptr(), KExpertsCPU.weights_cpu.data_ptr(), KExpertsCPU.input_tensor_cpu.data_ptr(), KExpertsCPU.output_cpu.data_ptr()))
+        if input_tensor.size(0) == 1 and torch.cuda.is_current_stream_capturing():
+            # Handle the case where input is [1, hidden_size]
+            input_tensor_reshaped = input_tensor.squeeze(0)  # Remove the batch dimension
+            expert_ids_reshaped = expert_ids.squeeze(0) if expert_ids.dim() > 1 else expert_ids  # Handle both [1, num_experts] and [num_experts]
+            weights_reshaped = weights.squeeze(0) if weights.dim() > 1 else weights  # Handle both [1, num_experts] and [num_experts]
+            
+            KExpertsCPU.input_tensor_cpu.copy_(input_tensor_reshaped, non_blocking=True)
+            KExpertsCPU.expert_ids_cpu.copy_(expert_ids_reshaped, non_blocking=True)
+            KExpertsCPU.weights_cpu.copy_(weights_reshaped, non_blocking=True)
+            
+            self.cpu_infer.submit_with_cuda_stream(
+                torch.cuda.current_stream().cuda_stream,
+                self.moe.forward(
+                    1,
+                    expert_ids_reshaped.size(0),
+                    KExpertsCPU.expert_ids_cpu.data_ptr(),
+                    KExpertsCPU.weights_cpu.data_ptr(),
+                    KExpertsCPU.input_tensor_cpu.data_ptr(),
+                    KExpertsCPU.output_cpu.data_ptr()
+                )
+            )
             self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
             KExpertsCPU.output_gpu_map[self.out_device].copy_(KExpertsCPU.output_cpu, non_blocking=True)
-            return KExpertsCPU.output_gpu_map[self.out_device]
+            return KExpertsCPU.output_gpu_map[self.out_device].unsqueeze(0)  # Add batch dimension back
         else:
             input_tensor = input_tensor.contiguous().cpu()
             expert_ids = expert_ids.contiguous().cpu()
             weights = weights.contiguous().to(torch.float32).cpu()
             output = torch.empty_like(input_tensor).contiguous()
-            self.cpu_infer.submit(self.moe.forward(expert_ids.size(0), expert_ids.size(1), expert_ids.data_ptr(), weights.data_ptr(), input_tensor.data_ptr(), output.data_ptr()))
+            
+            # Handle expert_ids shape for batch processing
+            expert_ids_size = expert_ids.size(1) if expert_ids.dim() > 1 else expert_ids.size(0)
+            
+            self.cpu_infer.submit(
+                self.moe.forward(
+                    expert_ids.size(0) if expert_ids.dim() > 1 else 1,
+                    expert_ids_size,
+                    expert_ids.data_ptr(),
+                    weights.data_ptr(),
+                    input_tensor.data_ptr(),
+                    output.data_ptr()
+                )
+            )
             self.cpu_infer.sync()
             return output.to(device=object.__getattribute__(self, "out_device"))
     
@@ -823,74 +868,80 @@ class KDeepseekV3MoE(BaseInjectedModule, DeepseekV3MoE):
         identity = hidden_states
         orig_shape = hidden_states.shape
         sequence_length = orig_shape[1]
+        
+        # Move all tensors to CPU
+        hidden_states = hidden_states.cpu()
+        
+        # Get top-k experts and weights
         topk_idx, topk_weight = self.gate(hidden_states)
+        topk_idx = topk_idx.cpu()
+        topk_weight = topk_weight.cpu()
+        
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         
-        # only for generate phase
-        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing():
-            self.experts.generate_experts.submit_for_one_decode(hidden_states[0], topk_idx[0], topk_weight[0])
-            if self.config.n_shared_experts is not None:
-                y_ = self.shared_experts(identity).squeeze(0)
-            y = self.experts.generate_experts.sync_for_one_decode().unsqueeze(0)
-            y += y_
-            y.resize_(*orig_shape)
-            return y
-
+        # Handle shared experts if configured
         if self.config.n_shared_experts is not None:
-            y_ = self.shared_experts(identity).squeeze(0)
-            
+            y_ = self.shared_experts(identity).cpu()
+        
+        # Use KExpertsBase implementation if available
         if isinstance(self.experts, KExpertsBase):
-            y = self.moe_kexperts(hidden_states, topk_idx, topk_weight).view(*orig_shape).to(device=hidden_states.device)
-        elif hidden_states.size(0) > 10:
-            # TODO may bugs here
-            y = (
-                self.moe_infer(hidden_states, topk_idx, topk_weight)
-                .view(*orig_shape)
-                .to(device=hidden_states.device)
-            )
+            y = self.moe_kexperts(hidden_states, topk_idx, topk_weight)
         else:
-            # TODO may bugs here
-            y = (
-                self.moe_infer_simple(hidden_states, topk_idx, topk_weight)
-                .view(*orig_shape)
-                .to(device=hidden_states.device)
-            )
+            # Use simple implementation for small batches
+            if hidden_states.size(0) <= 10:
+                y = self.moe_infer_simple(hidden_states, topk_idx, topk_weight)
+            else:
+                y = self.moe_infer(hidden_states, topk_idx, topk_weight)
+        
+        # Reshape output to original dimensions
+        y = y.view(*orig_shape)
+        
+        # Add shared experts output if configured
         if self.config.n_shared_experts is not None:
-            y += y_
-        return y
+            y = y + y_
+            
+        # Return result in original device
+        return y.to(device=identity.device)
 
     @torch.no_grad()
     def moe_kexperts(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
-        outs = self.experts(x, topk_ids, topk_weight)
-        return outs
+        # Ensure inputs are on CPU
+        x = x.cpu()
+        topk_ids = topk_ids.cpu()
+        topk_weight = topk_weight.cpu()
+        return self.experts(x, topk_ids, topk_weight)
 
     @torch.no_grad()
-    # TODO may bugs here
-    def moe_infer_simple(
-        self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        x: [num_tokens, hidden_size]
-        topk_ids, topk_weight: [num_tokens, num_selected_experts]
-        """
+    def moe_infer_simple(self, x: torch.Tensor, topk_ids: torch.Tensor, topk_weight: torch.Tensor) -> torch.Tensor:
+        # Ensure inputs are on CPU
+        x = x.cpu()
+        topk_ids = topk_ids.cpu()
+        topk_weight = topk_weight.cpu()
+        
         outs = torch.zeros_like(x)
         for token_idx in range(topk_ids.size(0)):
             for expert_idx in range(topk_ids.size(1)):
                 expert = self.experts[topk_ids[token_idx, expert_idx]]
-                outs[token_idx] += (
-                    expert.forward(x[token_idx]) * topk_weight[token_idx, expert_idx]
-                )
+                expert_out = expert.forward(x[token_idx])
+                outs[token_idx] += expert_out * topk_weight[token_idx, expert_idx]
         return outs
 
     @torch.no_grad()
-    # TODO may bugs here
     def moe_infer(self, x, topk_ids, topk_weight):
-        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
+        # Ensure inputs are on CPU
+        x = x.cpu()
+        topk_ids = topk_ids.cpu()
+        topk_weight = topk_weight.cpu()
+        
+        # Create counts tensor on CPU
+        cnts = torch.zeros((topk_ids.shape[0], len(self.experts)), dtype=torch.long, device='cpu')
         cnts.scatter_(1, topk_ids, 1)
         tokens_per_expert = cnts.sum(dim=0)
+        
+        # Sort indices on CPU
         idxs = topk_ids.view(-1).argsort()
         sorted_tokens = x[idxs // topk_ids.shape[1]]
-        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        tokens_per_expert = tokens_per_expert.numpy()
 
         outputs = []
         start_idx = 0
@@ -904,9 +955,13 @@ class KDeepseekV3MoE(BaseInjectedModule, DeepseekV3MoE):
             outputs.append(expert_out)
             start_idx = end_idx
 
-        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        if len(outputs) > 0:
+            outs = torch.cat(outputs, dim=0)
+        else:
+            outs = sorted_tokens.new_empty(0)
 
-        new_x = torch.empty_like(outs)
+        # Final processing on CPU
+        new_x = torch.empty_like(outs, device='cpu')
         new_x[idxs] = outs
         final_out = (
             new_x.view(*topk_ids.shape, -1)

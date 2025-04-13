@@ -128,6 +128,31 @@ target_include_directories(test_kvcache
     ${CUDA_INCLUDE_DIRS}
 )
 
+# Add test executable
+add_executable(test_deepseek_moe test/test_deepseek_moe.cpp)
+
+# Link test executable
+target_link_libraries(test_deepseek_moe
+        PRIVATE
+        cpuinfer_ext
+        ${Python3_LIBRARIES}
+        ${CUDA_LIBRARIES}
+        torch
+        torch_cpu
+        torch_python
+        c10
+        c10_cuda
+        cudart
+)
+
+target_include_directories(test_deepseek_moe
+        PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+        ${TORCH_INCLUDE_PATHS}
+        ${CUDA_INCLUDE_DIRS}
+)
+
 # Set compile options
 if(MSVC)
     target_compile_options(cpuinfer_ext PRIVATE /W4)

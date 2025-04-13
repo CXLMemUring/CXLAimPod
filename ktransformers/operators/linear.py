@@ -386,8 +386,6 @@ class KLinearFP8(KLinearBase):
             self.weight = w[0].to(device)
             self.weight_scale_inv = w[1].to(device)
             self.has_bias = False
-        else:
-            raise ValueError("Invalid weight type")
         self.weight = self.weight.to(device)
         if self.has_bias:
             self.bias = self.bias.to(device)

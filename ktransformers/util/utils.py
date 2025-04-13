@@ -15,7 +15,7 @@ from ktransformers.util.custom_gguf import translate_name_to_gguf
 from ktransformers.util.custom_gguf import GGUFLoader
 from ktransformers.operators import base_operator
 from ktransformers.models.custom_cache import StaticCache
-from ktransformers.util.cuda_graph_runner import CUDAGraphRunner
+from ktransformers.util.cuda_graph_runner import GraphRunner
 from ktransformers.util.textstream import TextStreamer
 from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
 
@@ -90,9 +90,11 @@ def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str 
         
         if translated_key in tensor_file_map:
             target_dtype = torch.get_default_dtype()
-            device = get_device(translated_key[:translated_key.rfind(".")], gguf_loader.tensor_device_map)
+            # device = get_device(translated_key[:translated_key.rfind(".")], gguf_loader.tensor_device_map)
+            device = "cpu"
             print(f"loading {translated_key} to {device}")
-            torch.cuda.empty_cache()
+            
+            # torch.cuda.empty_cache()
             weights = load_dequantized_tensor(translated_key, device=device).to(dtype=target_dtype)
             set_param(module, name, weights)
             del weights
@@ -131,7 +133,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             logits = cuda_graph_runner(cur_token, position_ids, cache_position)
         else:
             # custom_stream = torch.cuda.Stream()
-            torch.cuda.set_device(torch_device)
+            # torch.cuda.set_device(torch_device)
             inputs_embeds = model.model.embed_tokens(cur_token.to("cpu")).to(torch_device)
             # with torch.cuda.stream(custom_stream):
             logits=model(inputs_embeds=inputs_embeds,
@@ -141,8 +143,8 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                         return_dict=False, use_cache=True)[0]
         if past_key_values != None:
             past_key_values.change_seq_length(1)
-        for device in all_cuda_device:
-            torch.cuda.synchronize(device)
+        # for device in all_cuda_device:
+        #     torch.cuda.synchronize(device)
         #print(logits)
         next_token_scores = logits_warper(inputs, logits[:, -1, :])
         if generation_config.do_sample:
@@ -168,7 +170,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
         
         return logits
     
-    torch.cuda.set_device(torch_device)
+    # torch.cuda.set_device(torch_device)
     with torch.no_grad():
         
         stream = TextStreamer(tokenizer)
@@ -243,7 +245,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             global warm_uped
             if use_cuda_graph and ( (warm_uped == True and int(i) == 1) or (warm_uped == False and int(i) == 2) ):
                 warm_uped = True
-                cuda_graph_runner = CUDAGraphRunner()
+                cuda_graph_runner = GraphRunner()
                 cuda_graph_runner.capture(model, next_token.unsqueeze(0), position_ids, cache_position, past_key_values, torch_device, return_dict=False, use_cache=True)
             next_token = decode_one_tokens(cuda_graph_runner, next_token.unsqueeze(0), position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph).to(torch_device)
             inputs = torch.cat((inputs, next_token.unsqueeze(0)), dim=-1)
