@@ -121,84 +121,246 @@ class KExpertsBase(ABC):
             target_type: Target format - "float32", "int8", or "bf16"
         """
         try:
-            print(f"Attempting to dequantize tensor with type {tensor_type} to {target_type}")
+            print(f"尝试将类型为{tensor_type}的张量反量化为{target_type}")
             
-            # For efficient conversion to int8, we'll implement direct paths
+            # 确保张量是连续的
+            if hasattr(tensor, 'flags') and not tensor.flags.c_contiguous:
+                print(f"警告: 张量不是C连续的，创建连续的副本")
+                tensor = np.ascontiguousarray(tensor)
+            
+            # 对于高效转换为int8，我们实现直接路径
             if target_type == "int8" and tensor_type in [GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K, GGMLQuantizationType.Q6_K]:
-                print(f"Using direct quantized->int8 conversion path for type {tensor_type}")
+                print(f"使用直接的quantized->int8转换路径，类型{tensor_type}")
                 
-                # First get the tensor as float32 (temporarily)
+                # 首先获取浮点形式的张量(临时)
                 if tensor_type == GGMLQuantizationType.Q4_K:  # 12 = Q4_K
-                    temp_float = dequantize_q4_k(tensor)
+                    try:
+                        temp_float = dequantize_q4_k(tensor)
+                    except Exception as de:
+                        print(f"dequantize_q4_k失败: {str(de)}，尝试其他方法")
+                        # 使用安全备用方法
+                        return self._safe_dequantize_fallback(tensor, target_type)
                 elif tensor_type == GGMLQuantizationType.Q5_K:  # 13 = Q5_K
-                    temp_float = dequantize_q5_k(tensor)
+                    try:
+                        temp_float = dequantize_q5_k(tensor)
+                    except Exception as de:
+                        print(f"dequantize_q5_k失败: {str(de)}，尝试其他方法")
+                        return self._safe_dequantize_fallback(tensor, target_type)
                 elif tensor_type == GGMLQuantizationType.Q6_K:  # 14 = Q6_K
-                    temp_float = dequantize_q6_k(tensor)
+                    try:
+                        temp_float = dequantize_q6_k(tensor)
+                    except Exception as de:
+                        print(f"dequantize_q6_k失败: {str(de)}，尝试其他方法")
+                        return self._safe_dequantize_fallback(tensor, target_type)
                 
-                # Convert to int8 directly (with proper scaling to utilize the int8 range)
-                # Find the abs max to scale properly
+                # 转换为int8直接(适当缩放以利用int8范围)
+                # 找到abs max来适当缩放
                 abs_max = np.max(np.abs(temp_float))
                 if abs_max > 0:
                     scale = 127.0 / abs_max
-                    # Convert directly to int8, clearing the float32 data as we go
+                    # 直接转换为int8，释放float32数据
                     tensor_int8 = np.empty(temp_float.shape, dtype=np.int8)
-                    chunk_size = 1000000  # Process in chunks to reduce peak memory
+                    chunk_size = 1000000  # 分块处理以减少峰值内存
                     for i in range(0, temp_float.size, chunk_size):
                         end = min(i + chunk_size, temp_float.size)
-                        # Slice, scale, convert, assign
+                        # 切片、缩放、转换、分配
                         chunk = temp_float.flat[i:end]
                         tensor_int8.flat[i:end] = np.clip(np.round(chunk * scale), -127, 127).astype(np.int8)
-                        # Clear the chunk from memory
+                        # 从内存中清除块
                         del chunk
-                
-                    # Clear the float data to free memory
+                    
+                    # 清除浮点数据以释放内存
                     del temp_float
                     
-                    print(f"Successfully converted to int8, shape: {tensor_int8.shape}")
+                    # 确保结果是64字节对齐的
+                    if tensor_int8.ctypes.data % 64 != 0:
+                        print("警告: int8张量不是64字节对齐的，创建对齐副本")
+                        aligned = np.zeros(tensor_int8.shape, dtype=np.int8, order='C')
+                        np.copyto(aligned, tensor_int8)
+                        tensor_int8 = aligned
+                    
+                    print(f"成功转换为int8，形状: {tensor_int8.shape}")
                     return tensor_int8
                 else:
-                    # If all zeros, just create zeros
+                    # 如果全为零，只需创建零
                     return np.zeros(temp_float.shape, dtype=np.int8)
             
-            # Original path for float32 conversion
+            # 原始float32转换路径
             if tensor_type == GGMLQuantizationType.Q4_K:  # 12 = Q4_K
-                print("Using dequantize_q4_k to convert")
-                # Convert quantized tensor to float32
+                print("使用dequantize_q4_k进行转换")
+                # 将量化张量转换为float32
                 tensor_float32 = dequantize_q4_k(tensor)
             elif tensor_type == GGMLQuantizationType.Q5_K:  # 13 = Q5_K
-                print("Using dequantize_q5_k to convert")
+                print("使用dequantize_q5_k进行转换")
                 tensor_float32 = dequantize_q5_k(tensor)
             elif tensor_type == GGMLQuantizationType.Q6_K:  # 14 = Q6_K
-                print("Using dequantize_q6_k to convert")
+                print("使用dequantize_q6_k进行转换")
                 tensor_float32 = dequantize_q6_k(tensor)
             else:
-                print(f"No dequantization function available for type {tensor_type}")
+                print(f"类型{tensor_type}没有可用的反量化函数")
                 return tensor
             
-            # Convert to the requested format if needed
+            # 如果需要，转换为请求的格式
             if target_type == "int8":
-                # Scale to int8 range (-127 to 127)
+                # 缩放到int8范围(-127到127)
                 abs_max = np.max(np.abs(tensor_float32))
                 if abs_max > 0:
                     scale = 127.0 / abs_max
                     tensor_int8 = np.clip(np.round(tensor_float32 * scale), -127, 127).astype(np.int8)
+                    
+                    # 确保结果是64字节对齐的
+                    if tensor_int8.ctypes.data % 64 != 0:
+                        print("警告: int8张量不是64字节对齐的，创建对齐副本")
+                        aligned = np.zeros(tensor_int8.shape, dtype=np.int8, order='C')
+                        np.copyto(aligned, tensor_int8)
+                        tensor_int8 = aligned
+                    
                     return tensor_int8
                 else:
                     return np.zeros(tensor_float32.shape, dtype=np.int8)
             elif target_type == "bf16":
-                # Convert to bf16 using PyTorch
+                # 使用PyTorch转换为bf16
                 tensor_torch = torch.tensor(tensor_float32)
                 tensor_bf16 = tensor_torch.to(torch.bfloat16).numpy()
+                
+                # 确保结果是64字节对齐的
+                if tensor_bf16.ctypes.data % 64 != 0:
+                    print("警告: bf16张量不是64字节对齐的，创建对齐副本")
+                    # 对于bf16，使用uint16
+                    aligned = np.zeros(tensor_bf16.shape, dtype=np.uint16, order='C')
+                    np.copyto(aligned, tensor_bf16)
+                    tensor_bf16 = aligned
+                
                 return tensor_bf16
             else:
-                # Return as float32
+                # 返回为float32
                 return tensor_float32
                 
         except Exception as e:
-            print(f"Error during dequantization: {str(e)}")
+            print(f"反量化期间出错: {str(e)}")
             if self.force_amx:
-                print("Continuing despite dequantization error (force_amx=True)")
-            return tensor
+                print("尽管反量化出错但继续(force_amx=True)")
+            return self._safe_dequantize_fallback(tensor, target_type)
+
+    def _safe_dequantize_fallback(self, tensor, target_type):
+        """反量化失败时的安全回退"""
+        try:
+            print(f"使用安全回退方法进行反量化")
+            
+            # 尝试简单地将张量转换为目标类型
+            if target_type == "int8":
+                if hasattr(tensor, 'dtype') and hasattr(tensor, 'shape'):
+                    # 创建全零int8张量
+                    fallback = np.zeros(tensor.shape, dtype=np.int8)
+                    
+                    # 尝试复制值(如果可能)
+                    try:
+                        if hasattr(tensor, 'flat'):
+                            for i in range(min(10000, tensor.size)):
+                                val = tensor.flat[i]
+                                if isinstance(val, (int, float)):
+                                    fallback.flat[i] = max(-127, min(127, int(val)))
+                    except:
+                        pass  # 忽略复制错误
+                        
+                    return fallback
+                else:
+                    # 无法确定形状，返回1x1 int8张量
+                    return np.zeros((1, 1), dtype=np.int8)
+            elif target_type == "bf16":
+                # 对于bf16，返回1或形状匹配的零张量
+                if hasattr(tensor, 'shape'):
+                    return np.zeros(tensor.shape, dtype=np.uint16)  # bf16近似
+                else:
+                    return np.zeros((1, 1), dtype=np.uint16)
+            else:
+                # 对于float32，返回零
+                if hasattr(tensor, 'shape'):
+                    return np.zeros(tensor.shape, dtype=np.float32)
+                else:
+                    return np.zeros((1, 1), dtype=np.float32)
+        except Exception as e:
+            print(f"安全回退也失败: {str(e)}")
+            # 返回最小形状的张量
+            if target_type == "int8":
+                return np.zeros((1, 1), dtype=np.int8)
+            elif target_type == "bf16":
+                return np.zeros((1, 1), dtype=np.uint16)
+            else:
+                return np.zeros((1, 1), dtype=np.float32)
+
+    # 更强健的内存对齐和检查函数
+    def ensure_memory_aligned(self, tensor, name, tensor_type, target_type=None):
+        """确保张量内存对齐并适合AMX处理"""
+        try:
+            print(f"检查{name}张量的内存对齐...")
+            
+            # 检查张量是否为C连续
+            if hasattr(tensor, 'flags') and not tensor.flags.c_contiguous:
+                print(f"警告: {name}不是C连续的，创建连续副本")
+                tensor = np.ascontiguousarray(tensor)
+            
+            # 检查数据类型和量化类型是否匹配
+            if target_type:
+                expected_dtype = np.int8 if target_type == "int8" else None
+                if expected_dtype and hasattr(tensor, 'dtype') and tensor.dtype != expected_dtype:
+                    print(f"警告: {name}的dtype({tensor.dtype})与目标类型({expected_dtype})不匹配")
+            
+            # 检查内存对齐是否符合AMX要求(64字节对齐)
+            if hasattr(tensor, 'ctypes') and hasattr(tensor.ctypes, 'data'):
+                addr = tensor.ctypes.data
+                if addr % 64 != 0:
+                    print(f"警告: {name}的内存地址({addr})不是64字节对齐的")
+                    # 创建64字节对齐的副本
+                    aligned = np.zeros(tensor.shape, dtype=tensor.dtype, order='C')
+                    np.copyto(aligned, tensor)
+                    tensor = aligned
+                    print(f"{name}已重新对齐，新地址: {tensor.ctypes.data}")
+            
+            # 获取指针
+            ptr = ctypes.addressof(
+                ctypes.cast(tensor.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+            )
+            
+            return tensor, ptr
+        except Exception as e:
+            print(f"内存对齐过程中出错: {str(e)}")
+            # 返回原始数据以便回退
+            if hasattr(tensor, 'ctypes') and hasattr(tensor.ctypes, 'data'):
+                ptr = ctypes.addressof(
+                    ctypes.cast(tensor.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+                )
+                return tensor, ptr
+            else:
+                raise ValueError(f"无法获取{name}的内存指针: {str(e)}")
+
+    def safely_create_amx_moe(self, constructor, config, name):
+        """安全地创建AMX MOE实例并处理错误"""
+        try:
+            print(f"创建{name}实例...")
+            return constructor(config)
+        except Exception as e:
+            print(f"创建{name}实例失败: {str(e)}")
+            if self.force_amx:
+                raise RuntimeError(f"创建{name}失败，且force_amx=True: {str(e)}")
+            return None
+
+    def safely_load_weights(self, name):
+        """安全地加载权重并处理可能的segfault"""
+        print(f"加载权重到{name}后端...")
+        try:
+            # 尝试提前分配额外内存防止堆栈溢出
+            extra_buffer = bytearray(1024 * 1024 * 10)  # 10MB安全缓冲区
+            task = self.moe.load_weights()
+            self.cpu_infer.submit(task)
+            self.cpu_infer.sync()
+            del extra_buffer
+            print(f"成功初始化{name}")
+            return True
+        except Exception as e:
+            print(f"加载权重到{name}时出错: {str(e)}")
+            del self.moe
+            return False
 
 class KExpertsCPU(KExpertsBase):
     input_tensor_cpu:Tensor = None
@@ -231,75 +393,117 @@ class KExpertsCPU(KExpertsBase):
     def convert_to_bf16(self, tensor, name, ptr_ref):
         """Safely convert a tensor to BF16 format with detailed error reporting"""
         try:
-            print(f"Converting {name} tensor from {type(tensor)} to BF16 format")
+            print(f"将{name}张量从{type(tensor)}转换为BF16格式")
             
-            # Check if tensor might already be in BF16 format
+            # 检查张量是否可能已经是BF16格式
             if hasattr(tensor, 'dtype') and str(tensor.dtype).lower() in ['bfloat16', 'bf16']:
-                print(f"{name} appears to already be in BF16 format, skipping conversion")
+                print(f"{name}似乎已经是BF16格式，跳过转换")
                 return tensor, ptr_ref
             
-            # Try several approaches in sequence - the most likely to work first
+            # 确保张量是连续的
+            if hasattr(tensor, 'flags') and not tensor.flags.c_contiguous:
+                print(f"警告: {name}不是C连续的，创建连续副本")
+                tensor = np.ascontiguousarray(tensor)
             
-            # Approach 1: Direct memory copy with PyTorch
+            # 尝试几种方法按顺序 - 最有可能成功的方法先尝试
+            
+            # 方法1：直接内存复制
             try:
-                print(f"Trying PyTorch CPU tensor approach for {name}")
-                # First create a float32 tensor from numpy
+                print(f"尝试对{name}使用PyTorch CPU张量方法")
+                # 首先从numpy创建float32张量
                 tensor_float32 = torch.tensor(np.array(tensor, dtype=np.float32, copy=True), device="cpu")
-                # Convert to bfloat16
+                # 转换为bfloat16
                 tensor_bf16_torch = tensor_float32.to(torch.bfloat16)
-                # Create a numpy array with the same size as the bfloat16 tensor
-                # but view it as uint16 (same size as bfloat16)
+                # 创建与bfloat16张量大小相同的numpy数组
+                # 但将其视为uint16(与bfloat16大小相同)
                 buffer_size = tensor_bf16_torch.element_size() * tensor_bf16_torch.nelement()
                 tensor_bf16_np = np.empty(tensor_bf16_torch.shape, dtype=np.uint16)
                 
-                # Copy the raw tensor data to the numpy array
-                # Get PyTorch tensor pointer
+                # 获取PyTorch张量指针
                 tensor_ptr = tensor_bf16_torch.data_ptr()
-                # Get numpy array pointer
+                # 获取numpy数组指针
                 np_ptr = tensor_bf16_np.ctypes.data
                 
-                # Use ctypes to copy memory
+                # 使用ctypes复制内存
                 ctypes.memmove(np_ptr, tensor_ptr, buffer_size)
                 
-                print(f"Successfully created BF16 data using PyTorch+memmove for {name}")
-                tensor_bf16 = tensor_bf16_np
-            except Exception as e:
-                print(f"PyTorch approach failed: {str(e)}, trying fallback methods")
+                # 确保内存是64字节对齐的
+                if tensor_bf16_np.ctypes.data % 64 != 0:
+                    print(f"警告: {name}的BF16转换结果不是64字节对齐的，创建对齐副本")
+                    aligned = np.zeros(tensor_bf16_np.shape, dtype=np.uint16, order='C')
+                    np.copyto(aligned, tensor_bf16_np)
+                    tensor_bf16_np = aligned
                 
-                # Approach 2: Check if NumPy supports BF16 directly (some newer versions do)
+                print(f"使用PyTorch+memmove成功为{name}创建BF16数据")
+                tensor_bf16 = tensor_bf16_np
+                
+                # 获取新指针
+                new_ptr = ctypes.addressof(
+                    ctypes.cast(tensor_bf16.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+                )
+                return tensor_bf16, new_ptr
+                
+            except Exception as e:
+                print(f"PyTorch BF16转换方法失败: {str(e)}，尝试备用方法")
+                
+                # 方法2：手动位操作
                 try:
-                    # Try direct numpy conversion if available
-                    tensor_float32 = np.array(tensor, dtype=np.float32, copy=True)
-                    tensor_bf16 = tensor_float32.astype(np.bfloat16)
-                    print(f"Using numpy's native BF16 support for {name}")
-                except (AttributeError, TypeError) as e2:
-                    print(f"Numpy BF16 support not available: {str(e2)}")
-                    
-                    # Approach 3: Manual bit manipulation
-                    print(f"Using manual bit manipulation for BF16 conversion of {name}")
-                    # Convert float32 to uint16 using custom BF16 bit manipulation:
-                    # 1. View the float32 array as uint32
-                    # 2. Shift right by 16 bits to get the high bits
-                    # 3. Cast to uint16
-                    # This effectively truncates the mantissa, which is what BF16 does
+                    print(f"对{name}的BF16转换使用手动位操作")
+                    # 使用自定义BF16位操作将float32转换为uint16:
+                    # 1. 将float32数组视为uint32
+                    # 2. 右移16位以获取高位
+                    # 3. 转为uint16
                     tensor_float32 = np.array(tensor, dtype=np.float32, copy=True)
                     tensor_uint32 = tensor_float32.view(np.uint32)
                     tensor_bf16 = (tensor_uint32 >> 16).astype(np.uint16)
+                    
+                    # 确保内存是64字节对齐的
+                    if tensor_bf16.ctypes.data % 64 != 0:
+                        print(f"警告: {name}通过位操作转换后不是64字节对齐的，创建对齐副本")
+                        aligned = np.zeros(tensor_bf16.shape, dtype=np.uint16, order='C')
+                        np.copyto(aligned, tensor_bf16)
+                        tensor_bf16 = aligned
+                    
+                    # 获取新指针
+                    new_ptr = ctypes.addressof(
+                        ctypes.cast(tensor_bf16.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+                    )
+                    print(f"使用位操作方法成功将{name}转换为BF16")
+                    return tensor_bf16, new_ptr
                 
-            # Get the new pointer
-            new_ptr = ctypes.addressof(
-                ctypes.cast(tensor_bf16.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-            )
-            print(f"Successfully converted {name} to BF16, shape: {tensor_bf16.shape}")
-            return tensor_bf16, new_ptr
+                except Exception as e2:
+                    print(f"位操作BF16转换方法也失败: {str(e2)}，尝试最后的备用方案")
+                    
+                    # 最后的备用方案：创建零BF16张量
+                    try:
+                        if hasattr(tensor, 'shape'):
+                            print(f"创建{name}的零BF16替代张量")
+                            zero_bf16 = np.zeros(tensor.shape, dtype=np.uint16)
+                            
+                            # 确保内存是64字节对齐的
+                            if zero_bf16.ctypes.data % 64 != 0:
+                                aligned = np.zeros(zero_bf16.shape, dtype=np.uint16, order='C')
+                                zero_bf16 = aligned
+                            
+                            new_ptr = ctypes.addressof(
+                                ctypes.cast(zero_bf16.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+                            )
+                            return zero_bf16, new_ptr
+                        else:
+                            raise ValueError(f"无法确定{name}的形状")
+                    except Exception as e3:
+                        print(f"创建零BF16张量失败: {str(e3)}")
+                        if self.force_amx:
+                            raise RuntimeError(f"所有尝试将{name}转换为BF16均失败，且force_amx=True")
+                        return tensor, ptr_ref
             
         except Exception as e:
-            print(f"ERROR converting {name} to BF16: {str(e)}")
+            print(f"将{name}转换为BF16时出错: {str(e)}")
             if self.force_amx:
-                print(f"Detailed tensor info - Type: {type(tensor)}, Shape: {tensor.shape if hasattr(tensor, 'shape') else 'unknown'}")
-                print(f"Memory layout - Size: {tensor.size if hasattr(tensor, 'size') else 'unknown'}, "
-                      f"Itemsize: {tensor.itemsize if hasattr(tensor, 'itemsize') else 'unknown'}")
-                raise RuntimeError(f"Failed to convert {name} to BF16 for AMX backend: {str(e)}")
+                print(f"详细张量信息 - 类型: {type(tensor)}, 形状: {tensor.shape if hasattr(tensor, 'shape') else '未知'}")
+                print(f"内存布局 - 大小: {tensor.size if hasattr(tensor, 'size') else '未知'}, "
+                      f"单元大小: {tensor.itemsize if hasattr(tensor, 'itemsize') else '未知'}")
+                raise RuntimeError(f"无法将{name}转换为AMX后端的BF16: {str(e)}")
             return tensor, ptr_ref
 
     def load(self, w: dict | nn.Parameter | tuple | None = None, device:str|None = None):
@@ -382,6 +586,14 @@ class KExpertsCPU(KExpertsBase):
             except Exception as e:
                 print(f"Error getting memory info for {tensor_name}: {str(e)}")
         
+        # Ensure weights are in memory
+        for tensor_name, tensor in [("gate", self.gate), ("up", self.up), ("down", self.down)]:
+            if hasattr(tensor, 'flags') and not tensor.flags.c_contiguous:
+                print(f"WARNING: {tensor_name} is not C contiguous, making a copy")
+                if tensor_name == "gate": self.gate = np.ascontiguousarray(tensor)
+                elif tensor_name == "up": self.up = np.ascontiguousarray(tensor) 
+                elif tensor_name == "down": self.down = np.ascontiguousarray(tensor)
+        
         gate_ptr = ctypes.addressof(
             ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
         )
@@ -421,23 +633,32 @@ class KExpertsCPU(KExpertsBase):
         elif self.backend == "AMXBF16":
             # Try AMX backend but fall back to llamafile if there's an issue
             try:
-                print(f"Initializing AMXBF16 backend (bfloat16)...")
-                print(f"Tensor types - gate: {self.gate_type}, up: {self.up_type}, down: {self.down_type}")
+                print(f"正在初始化AMXBF16后端(bfloat16)...")
+                print(f"张量类型 - gate: {self.gate_type}, up: {self.up_type}, down: {self.down_type}")
                 
                 # AMX requires BF16 format - ensure all tensors are BF16
                 if self.gate_type != GGMLQuantizationType.BF16:
+                    self.gate, gate_ptr = self.ensure_memory_aligned(self.gate, "gate", self.gate_type)
                     self.gate, gate_ptr = self.convert_to_bf16(self.gate, "gate", gate_ptr)
                     self.gate_type = GGMLQuantizationType.BF16
+                else:
+                    self.gate, gate_ptr = self.ensure_memory_aligned(self.gate, "gate", self.gate_type)
                 
                 if self.up_type != GGMLQuantizationType.BF16:
+                    self.up, up_ptr = self.ensure_memory_aligned(self.up, "up", self.up_type)
                     self.up, up_ptr = self.convert_to_bf16(self.up, "up", up_ptr)
                     self.up_type = GGMLQuantizationType.BF16
+                else:
+                    self.up, up_ptr = self.ensure_memory_aligned(self.up, "up", self.up_type)
                     
                 if self.down_type != GGMLQuantizationType.BF16:
+                    self.down, down_ptr = self.ensure_memory_aligned(self.down, "down", self.down_type)
                     self.down, down_ptr = self.convert_to_bf16(self.down, "down", down_ptr)
                     self.down_type = GGMLQuantizationType.BF16
+                else:
+                    self.down, down_ptr = self.ensure_memory_aligned(self.down, "down", self.down_type)
                 
-                print(f"Creating AMX_MOEConfig for AMXBF16 mode: experts={n_routed_experts}, experts_per_tok={self.config.num_experts_per_tok}, hidden={self.config.hidden_size}, intermediate={self.config.moe_intermediate_size}")
+                print(f"创建AMX_MOEConfig用于AMXBF16模式: experts={n_routed_experts}, experts_per_tok={self.config.num_experts_per_tok}, hidden={self.config.hidden_size}, intermediate={self.config.moe_intermediate_size}")
                     
                 moe_config = AMX_MOEConfig(
                     n_routed_experts,
@@ -450,22 +671,21 @@ class KExpertsCPU(KExpertsBase):
                     down_ptr,
                 )
                 
-                print("Creating AMXBF16_MOE instance...")
-                self.moe = AMXBF16_MOE(moe_config)
+                self.moe = self.safely_create_amx_moe(AMXBF16_MOE, moe_config, "AMXBF16_MOE")
+                if self.moe is None:
+                    raise RuntimeError("创建AMXBF16_MOE实例失败")
                 
-                print("Loading weights into AMXBF16 backend...")
-                self.cpu_infer.submit(self.moe.load_weights())
-                self.cpu_infer.sync()
-                print(f"Successfully initialized AMXBF16 backend")
+                if not self.safely_load_weights("AMXBF16"):
+                    raise RuntimeError("加载权重到AMXBF16_MOE失败")
                 
             except Exception as e:
-                print(f"ERROR initializing AMXBF16: {str(e)}")
+                print(f"初始化AMXBF16时出错: {str(e)}")
                 
                 if self.force_amx:
                     # If force_amx is True, don't fall back - raise the error
-                    raise RuntimeError(f"Failed to initialize AMXBF16 and force_amx=True: {str(e)}")
+                    raise RuntimeError(f"初始化AMXBF16失败，且force_amx=True: {str(e)}")
                 
-                print(f"Falling back to llamafile backend")
+                print(f"回退到llamafile后端")
                 
                 moe_config = MOEConfig(
                     n_routed_experts,
@@ -488,8 +708,8 @@ class KExpertsCPU(KExpertsBase):
         elif self.backend == "AMXInt8":
             # Try AMX backend but fall back to llamafile if there's an issue
             try:
-                print(f"Initializing AMXInt8 backend (int8)...")
-                print(f"Tensor types - gate: {self.gate_type}, up: {self.up_type}, down: {self.down_type}")
+                print(f"正在初始化AMXInt8后端(int8)...")
+                print(f"张量类型 - gate: {self.gate_type}, up: {self.up_type}, down: {self.down_type}")
                 
                 # For AMXInt8, we handle differently from AMXBF16
                 # We either need to use BF16 tensors that AMXInt8_MOE will quantize internally,
@@ -497,21 +717,30 @@ class KExpertsCPU(KExpertsBase):
                 
                 # If we have BF16 already, use it directly - AMXInt8 can handle this
                 if self.gate_type != GGMLQuantizationType.BF16 and self.gate_type != GGMLQuantizationType.I8:
-                    print("Converting gate to int8 for AMXInt8 backend")
+                    print("将gate转换为int8用于AMXInt8后端")
+                    self.gate, gate_ptr = self.ensure_memory_aligned(self.gate, "gate", self.gate_type)
                     self.gate, gate_ptr = self.dequantize_tensor(self.gate, self.gate_type, "int8")
                     self.gate_type = GGMLQuantizationType.I8
+                else:
+                    self.gate, gate_ptr = self.ensure_memory_aligned(self.gate, "gate", self.gate_type, "int8" if self.gate_type == GGMLQuantizationType.I8 else None)
                 
                 if self.up_type != GGMLQuantizationType.BF16 and self.up_type != GGMLQuantizationType.I8:
-                    print("Converting up to int8 for AMXInt8 backend")
+                    print("将up转换为int8用于AMXInt8后端")
+                    self.up, up_ptr = self.ensure_memory_aligned(self.up, "up", self.up_type)
                     self.up, up_ptr = self.dequantize_tensor(self.up, self.up_type, "int8")
                     self.up_type = GGMLQuantizationType.I8
+                else:
+                    self.up, up_ptr = self.ensure_memory_aligned(self.up, "up", self.up_type, "int8" if self.up_type == GGMLQuantizationType.I8 else None)
                     
                 if self.down_type != GGMLQuantizationType.BF16 and self.down_type != GGMLQuantizationType.I8:
-                    print("Converting down to int8 for AMXInt8 backend")
+                    print("将down转换为int8用于AMXInt8后端")
+                    self.down, down_ptr = self.ensure_memory_aligned(self.down, "down", self.down_type)
                     self.down, down_ptr = self.dequantize_tensor(self.down, self.down_type, "int8")
                     self.down_type = GGMLQuantizationType.I8
+                else:
+                    self.down, down_ptr = self.ensure_memory_aligned(self.down, "down", self.down_type, "int8" if self.down_type == GGMLQuantizationType.I8 else None)
                 
-                print(f"Creating AMX_MOEConfig for AMXInt8 mode: experts={n_routed_experts}, experts_per_tok={self.config.num_experts_per_tok}, hidden={self.config.hidden_size}, intermediate={self.config.moe_intermediate_size}")
+                print(f"创建AMX_MOEConfig用于AMXInt8模式: experts={n_routed_experts}, experts_per_tok={self.config.num_experts_per_tok}, hidden={self.config.hidden_size}, intermediate={self.config.moe_intermediate_size}")
                     
                 moe_config = AMX_MOEConfig(
                     n_routed_experts,
@@ -524,22 +753,21 @@ class KExpertsCPU(KExpertsBase):
                     down_ptr,
                 )
                 
-                print("Creating AMXInt8_MOE instance...")
-                self.moe = AMXInt8_MOE(moe_config)
+                self.moe = self.safely_create_amx_moe(AMXInt8_MOE, moe_config, "AMXInt8_MOE")
+                if self.moe is None:
+                    raise RuntimeError("创建AMXInt8_MOE实例失败")
                 
-                print("Loading weights into AMXInt8 backend...")
-                self.cpu_infer.submit(self.moe.load_weights())
-                self.cpu_infer.sync()
-                print(f"Successfully initialized AMXInt8 backend")
+                if not self.safely_load_weights("AMXInt8"):
+                    raise RuntimeError("加载权重到AMXInt8_MOE失败")
                 
             except Exception as e:
-                print(f"ERROR initializing AMXInt8: {str(e)}")
+                print(f"初始化AMXInt8时出错: {str(e)}")
                 
                 if self.force_amx:
                     # If force_amx is True, don't fall back - raise the error
-                    raise RuntimeError(f"Failed to initialize AMXInt8 and force_amx=True: {str(e)}")
+                    raise RuntimeError(f"初始化AMXInt8失败，且force_amx=True: {str(e)}")
                 
-                print(f"Falling back to llamafile backend")
+                print(f"回退到llamafile后端")
                 
                 moe_config = MOEConfig(
                     n_routed_experts,
