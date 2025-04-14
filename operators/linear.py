@@ -190,7 +190,7 @@ class KLinearMarlin(KLinearBase):
         if device is None: device = self.device
         
         # 处理CPU设备情况
-        self.use_cpu_fallback = device.lower() == "cpu"
+        self.use_cpu_fallback = True
         
         if w is None: w = self.load_weight(device=device)
 
@@ -368,8 +368,8 @@ class KLinearCPUInfer(KLinearBase):
         config = cpuinfer_ext.linear.LinearConfig(self.in_features, self.out_features, self.stride, self.group_max_len, weight_ptr, self.weight_type, 30)
         self.linear = cpuinfer_ext.linear.Linear(config)
         
-        self.input_tensor_cpu = torch.zeros((1, 1, self.in_features), device="cpu", pin_memory=True)
-        self.output_cpu = torch.zeros((1, 1, self.out_features), device="cpu", pin_memory=True, dtype=torch.bfloat16)
+        self.input_tensor_cpu = torch.zeros((1, 1, self.in_features), device="cpu")
+        self.output_cpu = torch.zeros((1, 1, self.out_features), device="cpu", dtype=torch.bfloat16)
         self.output_gpu = torch.zeros((1, 1, self.out_features), device=self.out_device)
 
     def warmup(self):

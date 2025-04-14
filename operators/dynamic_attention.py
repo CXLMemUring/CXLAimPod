@@ -118,33 +118,30 @@ class DynamicScaledDotProductAttention:
             (1, 1, self.q_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=True,
         )
         self.k_in_cpu = torch.zeros(
             (1, 1, self.kv_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=True,
         )
         self.v_in_cpu = torch.zeros(
             (1, 1, self.kv_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=True,
         )
 
         self.cache_seqlens_cpu = torch.empty(
-            (1,), device="cpu", dtype=torch.int32, pin_memory=True
+            (1,), device="cpu", dtype=torch.int32
         )
 
         self.cache_seqlens_cuda = torch.empty((1,), device=device, dtype=torch.int32)
 
         self.prefix_block_table = torch.arange(
-            self.block_num, device="cpu", dtype=torch.int32, pin_memory=True
+            self.block_num, device="cpu", dtype=torch.int32
         ).view(1, -1)
 
         self.block_table_cpu = torch.arange(
-            self.block_num, device="cpu", dtype=torch.int32, pin_memory=True
+            self.block_num, device="cpu", dtype=torch.int32
         ).view(1, -1)
 
         # assert (
@@ -156,10 +153,9 @@ class DynamicScaledDotProductAttention:
             (1, 1, self.q_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=True,
         )
         self.lse_cpu = torch.empty(
-            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=True
+            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32
         )
 
         self.output_cuda = torch.empty(
@@ -167,7 +163,7 @@ class DynamicScaledDotProductAttention:
         )
 
         self.attn_sparsity = torch.zeros(
-            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=True
+            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32
         )
 
         if preselect_block == True:
@@ -479,8 +475,8 @@ class DynamicScaledDotProductAttention:
                 value[batch_idx].view(-1, self.kv_head_num, self.head_dim)
             )
 
-        k_cache_cpu = torch.empty_like(k_cache, device="cpu", pin_memory=True)
-        v_cache_cpu = torch.empty_like(v_cache, device="cpu", pin_memory=True)
+        k_cache_cpu = torch.empty_like(k_cache, device="cpu")
+        v_cache_cpu = torch.empty_like(v_cache, device="cpu")
 
         k_cache_cpu.copy_(k_cache)
         v_cache_cpu.copy_(v_cache)

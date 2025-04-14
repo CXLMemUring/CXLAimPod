@@ -35,6 +35,7 @@ from abc import ABC, abstractmethod
 from ktransformers.operators.linear import KLinearMarlin, KLinearTorch, KTransformersLinear
 import time
 from ktransformers.operators.cpuinfer import CPUInfer
+from numpy.lib.stride_tricks import as_strided
 
 
 # class Base(BaseInjectedModule, ABC):
@@ -174,10 +175,8 @@ class KExpertsBase(ABC):
                     
                     # 确保结果是64字节对齐的
                     if tensor_int8.ctypes.data % 64 != 0:
-                        print("警告: int8张量不是64字节对齐的，创建对齐副本")
-                        aligned = np.zeros(tensor_int8.shape, dtype=np.int8, order='C')
-                        np.copyto(aligned, tensor_int8)
-                        tensor_int8 = aligned
+                        print("警告: int8张量不是64字节对齐的，创建对齐视图")
+                        tensor_int8 = self.get_aligned_view(tensor_int8)
                     
                     print(f"成功转换为int8，形状: {tensor_int8.shape}")
                     return tensor_int8
@@ -351,16 +350,62 @@ class KExpertsBase(ABC):
         try:
             # 尝试提前分配额外内存防止堆栈溢出
             extra_buffer = bytearray(1024 * 1024 * 10)  # 10MB安全缓冲区
-            task = self.moe.load_weights()
-            self.cpu_infer.submit(task)
-            self.cpu_infer.sync()
+            
+            # 直接调用load_weights而不是将其作为任务提交
+            print(f"直接调用{name}的load_weights()")
+            self.moe.load_weights()
+            
             del extra_buffer
             print(f"成功初始化{name}")
             return True
         except Exception as e:
             print(f"加载权重到{name}时出错: {str(e)}")
-            del self.moe
+            if hasattr(self, 'moe'):
+                del self.moe
             return False
+
+    def get_aligned_view(self, tensor, dtype=None):
+        """创建64字节对齐的视图而非复制数据
+        
+        Args:
+            tensor: 要对齐的张量
+            dtype: 如果提供，转换为指定类型；否则保持原类型
+            
+        Returns:
+            aligned_tensor: 64字节对齐的张量视图
+        """
+        from numpy.lib.stride_tricks import as_strided
+        
+        # 如果已经对齐，直接返回
+        if tensor.ctypes.data % 64 == 0:
+            if dtype is not None and tensor.dtype != dtype:
+                # 仅在需要类型转换时复制
+                return tensor.astype(dtype)
+            return tensor
+            
+        # 如果需要类型转换，提前执行
+        if dtype is not None and tensor.dtype != dtype:
+            tensor = tensor.astype(dtype)
+        
+        # 创建略大的缓冲区以确保可以对齐
+        buffer_size = tensor.size + 16  # 额外空间用于对齐
+        buffer = np.zeros(buffer_size, dtype=tensor.dtype)
+        
+        # 计算对齐偏移量（以元素为单位）
+        offset = (64 - (buffer.ctypes.data % 64)) // buffer.itemsize
+        if offset == 64 // buffer.itemsize:
+            offset = 0
+            
+        # 使用as_strided创建视图
+        aligned = as_strided(buffer[offset:], 
+                            shape=tensor.shape,
+                            strides=tensor.strides)
+        
+        # 复制数据到对齐区域（这是唯一需要的复制，但不会额外分配内存）
+        aligned[...] = tensor
+        
+        print(f"创建了对齐的视图: 原地址={tensor.ctypes.data}, 新地址={aligned.ctypes.data}")
+        return aligned
 
 class KExpertsCPU(KExpertsBase):
     input_tensor_cpu:Tensor = None
@@ -791,12 +836,11 @@ class KExpertsCPU(KExpertsBase):
         if self.out_device not in KExpertsCPU.output_gpu_map:
             KExpertsCPU.output_gpu_map[self.out_device] = torch.zeros((self.max_chunk_size, self.config.hidden_size), device=self.out_device)
         if KExpertsCPU.input_tensor_cpu == None:
-            # Check if CUDA is available before using pin_memory
-            use_pin_memory = torch.cuda.is_available()
-            KExpertsCPU.input_tensor_cpu = torch.zeros((self.max_chunk_size, self.config.hidden_size), device="cpu", pin_memory=use_pin_memory)
-            KExpertsCPU.expert_ids_cpu = torch.zeros((self.max_chunk_size, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=use_pin_memory)
-            KExpertsCPU.weights_cpu = torch.zeros((self.max_chunk_size, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=use_pin_memory)
-            KExpertsCPU.output_cpu = torch.zeros((self.max_chunk_size, self.config.hidden_size), device="cpu", pin_memory=use_pin_memory, dtype=torch.bfloat16)
+            # Don't use pin_memory since it's not supported in the current environment
+            KExpertsCPU.input_tensor_cpu = torch.zeros((self.max_chunk_size, self.config.hidden_size), device="cpu")
+            KExpertsCPU.expert_ids_cpu = torch.zeros((self.max_chunk_size, num_experts_per_tok), device="cpu", dtype=torch.long)
+            KExpertsCPU.weights_cpu = torch.zeros((self.max_chunk_size, num_experts_per_tok), device="cpu", dtype=torch.float32)
+            KExpertsCPU.output_cpu = torch.zeros((self.max_chunk_size, self.config.hidden_size), device="cpu", dtype=torch.bfloat16)
     
     def warmup(self):
         self.cpu_infer.submit(self.moe.warm_up())

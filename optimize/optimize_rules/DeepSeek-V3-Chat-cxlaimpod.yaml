@@ -1,0 +1,51 @@
+# Sparse Attention Configuration
+- match:
+    name: "^model\\.layers\\..*\\.self_attn$"
+  replace:
+    class: "ktransformers.operators.attention.KCustomAttention"  # Your custom attention class
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu"
+      block_size: 128  # Size of attention blocks for sparse attention
+      local_windows_len: 1024  # Local window size
+      topk: 16  # Number of top blocks to attend to
+      use_attn_sparsity: true
+      preselect_block: true
+      preselect_block_count: 64  # Number of blocks to preselect
+
+# MoE Configuration
+- match:
+    name: "^model\\.layers\\..*\\.mlp$"
+    class: "ktransformers.models.modeling_mixtral.MixtralSparseMoeBlock"  # Adjust class name to your model
+  replace:
+    class: "ktransformers.operators.experts.KMistralSparseMoEBlock"  # Or your custom MoE class
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu"
+
+- match:
+    name: "^model\\.layers\\..*\\.mlp\\.experts$"
+  replace:
+    class: "ktransformers.operators.experts.KTransformersExperts"
+    kwargs:
+      prefill_device: "cpu"
+      prefill_op: "KExpertsTorch"
+      generate_device: "cpu"
+      generate_op: "KExpertsCPU"
+      out_device: "cpu"
+      # Custom memory parameters
+      max_chunk_size: 512  # Control memory usage by limiting chunk size
+      backend: "llamafile"  # Use the llamafile backend for CPU optimization
+  recursive: false  # Don't recursively inject submodules
+
+# Linear layers optimization
+- match:
+    name: "^model\\.layers\\..*$"
+    class: torch.nn.Linear
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
