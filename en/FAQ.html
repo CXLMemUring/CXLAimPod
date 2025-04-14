@@ -218,7 +218,7 @@ Refer to the ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-multi-gpu-4.
  replace:
    class: ktransformers.operators.experts.KTransformersExperts  
    kwargs:
-     generate_device: "cuda:0" # run in cuda:0; marlin only support GPU
+     generate_device: "cpu" # run in cuda:0; marlin only support GPU
      generate_op:  "KExpertsMarlin" # use marlin expert
  recursive: False
 </code></pre>

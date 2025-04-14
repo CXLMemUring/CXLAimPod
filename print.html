@@ -677,8 +677,8 @@ is speed up which is inspiring. So our showcase makes use of this finding</em></
   replace:
     class: ktransformers.operators.attention.KDeepseekV2Attention # optimized MLA implementation
     kwargs:
-      generate_device: "cuda"
-      prefill_device: "cuda"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       absorb_for_prefill: True # change this to True to enable long context(prefill may slower).
 </code></pre>
 <p>If the VRAM is still insufficient, try reducing the <code>chunk_prefill_size</code> parameter (default is 8192) to further decrease the intermediate results during chunk prefill.</p>
@@ -853,11 +853,11 @@ Note that we only use these parameters when layer-wise prefilling is enabled; ot
     class: ktransformers.operators.experts.KTransformersExperts     # custom MoE Kernel with expert parallelism
     device: "cpu"   # device to load this module on initialization
     kwargs:
-      prefill_device: "cuda"
+      prefill_device: "cpu"
       prefill_op: "KExpertsTorch"
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 </code></pre>
 <p>If we inject the expert list as a custom module, we can't use the interface in <code>nn.ModuleList</code> as default. We need to change the forward function in the FFN module. The simplest way is implementing a new module using custom forward function and inject it. We have implemented the new module, and the injection can be done by simply adding an injection rule. We can use the <code>class</code> instead of <code>name</code> to match a module that will be replaced. Here is the YAML rule:</p>
@@ -876,8 +876,8 @@ We also need to transfer some keywords similar to the injection of experts. Here
   replace:
     class: ktransformers.operators.linear.KTransformersLinear  # optimized Kernel on quantized data types
     kwargs:
-      generate_device: "cuda"
-      prefill_device: "cuda"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       generate_op: "KLinearMarlin"
       prefill_op: "KLinearTorch"
 </code></pre>
@@ -919,7 +919,7 @@ The only thing you need to do is wrap your custom module and write YAML files. W
   replace:
     class: "default"
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       # your_op_param_1: 1234
       # your_op_param_2: 5678
   recursive: True
@@ -1001,7 +1001,7 @@ From the <code>modeling_deepseek.py</code> file, we can see the specific impleme
     kwargs:
       generate_device: "cpu"
       generate_op: "MLPCPUExperts"
-      out_device: "cuda"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 </code></pre>
 <p>If we inject Routed Experts as a custom module, we cannot use the interfaces in the original <code>nn.ModuleList</code>. Therefore, it is necessary to modify the forward function in the FFN module. The simplest method is to implement a new module with a custom forward function and inject it.</p>
@@ -1018,7 +1018,7 @@ From the <code>modeling_deepseek.py</code> file, we can see the specific impleme
   replace:
     class: ktransformers.operators.linear.KTransformersLinear  # Optimized kernel on quantized data types
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
       generate_op: "QuantizedLinearMarlin"
 </code></pre>
 <h2 id="injection-of-modules-with-pre-calculated-buffers"><a class="header" href="#injection-of-modules-with-pre-calculated-buffers">Injection of Modules with Pre-calculated Buffers</a></h2>
@@ -1035,7 +1035,7 @@ From the <code>modeling_deepseek.py</code> file, we can see the specific impleme
   replace:
     class: "default"
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
   
 - match:
     name: "^model.embed_tokens"
@@ -1069,9 +1069,9 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
   replace:
     class: ktransformers.operators.experts.KTransformersExperts     # Custom MoE kernel with expert parallelism
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op: "MLPCUDAExperts"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 </code></pre>
 <p>But for two GPUs, we need to set the device for each module in the model.</p>
@@ -1083,7 +1083,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 
 # allocate 30-59 layers‘s out_device to cuda:1
@@ -1108,7 +1108,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         **kwargs,
     ):
         super().__init__(key, gguf_loader, config, orig_module, generate_device, **kwargs)
@@ -1121,7 +1121,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         my_param: bool = True,
         **kwargs,
     ):
@@ -1135,7 +1135,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
   replace:
     class: ktransformers.operators.linear.LinearTorchInject  # Inject module path
     kwargs: # Extra parameters
-      generate_device: "cuda"
+      generate_device: "cpu"
       my_param: True
 </code></pre>
 <p>For the linear module, it is also necessary to read weights from a gguf file. We provide the <code>KLinearBase</code> class to help users read weights from gguf files. Users only need to inherit and implement the load, unload, and forward functions. Therefore, a fully injectable linear class would look like this:</p>
@@ -1146,7 +1146,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         **kwargs,
     ):
         super().__init__(key, gguf_loader, config, orig_module, generate_device, **kwargs)
@@ -1215,9 +1215,9 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
   replace:
     class: ktransformers.operators.experts.KTransformersExperts     # Custom MoE kernel with expert parallelism
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op: "MLPCUDAExperts"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 </code></pre>
 <p>But for two GPUs, we need to set the device for each module in the model.</p>
@@ -1229,7 +1229,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 
 # allocate 30-59 layers‘s out_device to cuda:1
@@ -1255,7 +1255,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False
 </code></pre>
 <p>But we got extra 60GB VRAM on cuda:0, we can move experts in layer 4~8 to cuda:0.</p>
@@ -1265,7 +1265,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
   replace:
     class: ktransformers.operators.experts.KTransformersExperts  
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op:  "KExpertsMarlin"
   recursive: False
 
@@ -1276,7 +1276,7 @@ DeepseekV2-Chat got 60 layers, if we got 2 GPUs, we can allocate 30 layers to ea
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False 
 </code></pre>
 <p>Adjust the layer range as you want. Note that:</p>
@@ -1605,7 +1605,7 @@ Refer to the ktransformers/optimize/optimize_rules/DeepSeek-V3-Chat-multi-gpu-4.
  replace:
    class: ktransformers.operators.experts.KTransformersExperts  
    kwargs:
-     generate_device: "cuda:0" # run in cuda:0; marlin only support GPU
+     generate_device: "cpu" # run in cuda:0; marlin only support GPU
      generate_op:  "KExpertsMarlin" # use marlin expert
  recursive: False
 </code></pre>

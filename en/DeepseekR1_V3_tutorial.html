@@ -368,8 +368,8 @@ is speed up which is inspiring. So our showcase makes use of this finding</em></
   replace:
     class: ktransformers.operators.attention.KDeepseekV2Attention # optimized MLA implementation
     kwargs:
-      generate_device: "cuda"
-      prefill_device: "cuda"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       absorb_for_prefill: True # change this to True to enable long context(prefill may slower).
 </code></pre>
 <p>If the VRAM is still insufficient, try reducing the <code>chunk_prefill_size</code> parameter (default is 8192) to further decrease the intermediate results during chunk prefill.</p>
