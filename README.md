@@ -151,7 +151,7 @@ Below is an example of a YAML template for replacing all original Linear modules
     class: ktransformers.operators.linear.KTransformerLinear  # optimized Kernel on quantized data types
     device: "cpu"   # which devices to load this module when initializing
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
       generate_linear_type: "QuantizedLinearMarlin"
 ```
 

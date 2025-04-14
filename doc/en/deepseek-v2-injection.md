@@ -112,11 +112,11 @@ In the original implementation of Transformers, MoE is implemented using `nn.Mod
     class: ktransformers.operators.experts.KTransformersExperts     # custom MoE Kernel with expert parallelism
     device: "cpu"   # device to load this module on initialization
     kwargs:
-      prefill_device: "cuda"
+      prefill_device: "cpu"
       prefill_op: "KExpertsTorch"
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 ```
 
@@ -142,8 +142,8 @@ We also need to transfer some keywords similar to the injection of experts. Here
   replace:
     class: ktransformers.operators.linear.KTransformersLinear  # optimized Kernel on quantized data types
     kwargs:
-      generate_device: "cuda"
-      prefill_device: "cuda"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       generate_op: "KLinearMarlin"
       prefill_op: "KLinearTorch"
 ```

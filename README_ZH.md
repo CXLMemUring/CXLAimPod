@@ -140,7 +140,7 @@ generated = prefill_and_generate(model, tokenizer, input_tensor.cuda(), max_new_
     class: ktransformers.operators.linear.KTransformerLinear  # 量化数据类型的优化内核
     device: "cpu"   # 初始化时加载该模块的 device
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
       generate_linear_type: "QuantizedLinearMarlin"
 ```
 

@@ -40,10 +40,7 @@ def set_param(module: nn.Module, name: str, weights: torch.Tensor):
     setattr(module, name, param)
 
 def get_device(gguf_module_key:str, device_map:dict):
-    if gguf_module_key in device_map:
-        return device_map[gguf_module_key]["generate_device"]
-    else:
-        return "cpu"
+    return "cpu"
 
 def get_all_used_cuda_device(device_map:dict):
     all_device_list = set()

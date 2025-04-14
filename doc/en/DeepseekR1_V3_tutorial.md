@@ -170,8 +170,8 @@ If you want to use long context(longer than 20K) for prefill, enable the matrix 
   replace:
     class: ktransformers.operators.attention.KDeepseekV2Attention # optimized MLA implementation
     kwargs:
-      generate_device: "cuda"
-      prefill_device: "cuda"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       absorb_for_prefill: True # change this to True to enable long context(prefill may slower).
 ```
 

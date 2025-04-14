@@ -46,7 +46,7 @@ from-https://github.com/kvcache-ai/ktransformers/issues/129#issue-2842799552
      replace:
        class: ktransformers.operators.experts.KTransformersExperts  
        kwargs:
-         generate_device: "cuda:0" # run in cuda:0; marlin only support GPU
+         generate_device: "cpu" # run in cuda:0; marlin only support GPU
          generate_op:  "KExpertsMarlin" # use marlin expert
      recursive: False
     ```

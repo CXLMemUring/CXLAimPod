@@ -18,7 +18,7 @@ The basic form of the injection rules for the Inject framework is as follows:
   replace:
     class: "default"
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       # your_op_param_1: 1234
       # your_op_param_2: 5678
   recursive: True
@@ -106,7 +106,7 @@ In the source code of the transformer, MoE is implemented using nn.ModuleList. W
     kwargs:
       generate_device: "cpu"
       generate_op: "MLPCPUExperts"
-      out_device: "cuda"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 ```
 
@@ -129,7 +129,7 @@ For the remaining linear layer modules, we aim to use quantized operators to sav
   replace:
     class: ktransformers.operators.linear.KTransformersLinear  # Optimized kernel on quantized data types
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
       generate_op: "QuantizedLinearMarlin"
 ```
 ## Injection of Modules with Pre-calculated Buffers
@@ -151,7 +151,7 @@ Finally, we set a fallback basic attribute generate_device for all modules:
   replace:
     class: "default"
     kwargs:
-      generate_device: "cuda"
+      generate_device: "cpu"
   
 - match:
     name: "^model.embed_tokens"
@@ -196,9 +196,9 @@ For example, for `routed experts`, the yaml for one GPU is:
   replace:
     class: ktransformers.operators.experts.KTransformersExperts     # Custom MoE kernel with expert parallelism
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op: "MLPCUDAExperts"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 ```
 But for two GPUs, we need to set the device for each module in the model. 
@@ -212,7 +212,7 @@ But for two GPUs, we need to set the device for each module in the model.
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 
 # allocate 30-59 layers‘s out_device to cuda:1
@@ -242,7 +242,7 @@ class LinearTorchInject(BaseInjectedModule):
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         **kwargs,
     ):
         super().__init__(key, gguf_loader, config, orig_module, generate_device, **kwargs)
@@ -256,7 +256,7 @@ class LinearTorchInject(BaseInjectedModule):
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         my_param: bool = True,
         **kwargs,
     ):
@@ -271,7 +271,7 @@ Then our injection rule can be written as:
   replace:
     class: ktransformers.operators.linear.LinearTorchInject  # Inject module path
     kwargs: # Extra parameters
-      generate_device: "cuda"
+      generate_device: "cpu"
       my_param: True
 ```
 For the linear module, it is also necessary to read weights from a gguf file. We provide the `KLinearBase` class to help users read weights from gguf files. Users only need to inherit and implement the load, unload, and forward functions. Therefore, a fully injectable linear class would look like this:
@@ -283,7 +283,7 @@ class LinearTorchInject(BaseInjectedModule, KLinearBase):
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module = None,
-        generate_device: str = "cuda",
+        generate_device: str = "cpu",
         **kwargs,
     ):
         super().__init__(key, gguf_loader, config, orig_module, generate_device, **kwargs)

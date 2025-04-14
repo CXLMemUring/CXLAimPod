@@ -34,9 +34,9 @@ For example, for `routed experts`, the yaml for one GPU is:
   replace:
     class: ktransformers.operators.experts.KTransformersExperts     # Custom MoE kernel with expert parallelism
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op: "MLPCUDAExperts"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # Don't recursively inject submodules of this module
 ```
 But for two GPUs, we need to set the device for each module in the model. 
@@ -50,7 +50,7 @@ But for two GPUs, we need to set the device for each module in the model.
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 
 # allocate 30-59 layers‘s out_device to cuda:1
@@ -81,7 +81,7 @@ For example, the yaml for two GPUs is:
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False
 ```
 
@@ -94,7 +94,7 @@ But we got extra 60GB VRAM on cuda:0, we can move experts in layer 4~8 to cuda:0
   replace:
     class: ktransformers.operators.experts.KTransformersExperts  
     kwargs:
-      generate_device: "cuda:0"
+      generate_device: "cpu"
       generate_op:  "KExpertsMarlin"
   recursive: False
 
@@ -105,7 +105,7 @@ But we got extra 60GB VRAM on cuda:0, we can move experts in layer 4~8 to cuda:0
     kwargs:
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False 
 ```
 

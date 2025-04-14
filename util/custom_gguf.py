@@ -292,17 +292,14 @@ class GGUFLoader:
 
         data = self.get_mmap_tensor(name)
 
-        if "cpu" in device.lower():
-            values = GGML_DEQUANTIZE_GPU[ggml_name](data, device)
-            #values = GGML_DEQUANTIZE[ggml_name](data)
-            #print("load_gguf_tensor")
-            #values = torch.from_numpy(values).to(device = device)
-        else:
-            values = GGML_DEQUANTIZE[ggml_name](data)
-            values = torch.from_numpy(values)
+        
+        values = GGML_DEQUANTIZE[ggml_name](data)
+        values = torch.from_numpy(values)
         if ggml_name == "BF16":
             values = values.view(torch.bfloat16)
+        
         values = values.view(shape[::-1])
+            
         if "attn_q" in name and self.gguf_file_meta['general.architecture'] in ["llama"]:
             n_head = self.gguf_file_meta['llama.attention.head_count']
             values = (values.reshape(n_head, values.shape[0] // n_head // 2, 2, *values.shape[1:])

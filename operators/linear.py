@@ -182,9 +182,17 @@ class KLinearMarlin(KLinearBase):
         self.group_size = group_size
         self.act_order = act_order
         self.is_k_full = is_k_full
+        self.use_cpu_fallback = device.lower() == "cpu"
+        if self.use_cpu_fallback:
+            print(f"Using CPU fallback for Marlin quantized linear on {key}")
 
     def load(self, w: dict | nn.Parameter | tuple | None = None, device: str|None = None):
-        if w is None: w = self.load_weight(device="cpu")
+        if device is None: device = self.device
+        
+        # 处理CPU设备情况
+        self.use_cpu_fallback = device.lower() == "cpu"
+        
+        if w is None: w = self.load_weight(device=device)
 
         if isinstance(w, nn.Parameter):
             # pad weight
@@ -197,6 +205,17 @@ class KLinearMarlin(KLinearBase):
             self.has_bias = True
         else:
             raise ValueError("Invalid weight type")
+        
+        # CPU实现路径
+        if self.use_cpu_fallback:
+            # 在CPU上保存完整权重供计算使用
+            self.weight = weight.to(device=device)
+            if self.has_bias:
+                self.bias = self.bias.to(device=device)
+            print(f"Loaded weights for CPU Marlin fallback, shape: {self.weight.shape}")
+            return
+        
+        # GPU实现路径
         weight = weight.to(device)
         if self.has_bias:
             self.bias = self.bias.to(device)
@@ -205,7 +224,7 @@ class KLinearMarlin(KLinearBase):
             weight, self.num_bits, self.group_size, self.act_order
         )
         self.workspace = MarlinWorkspace(
-            self.out_features, GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MAX_PARALLEL,self.device
+            self.out_features, GPTQ_MARLIN_MIN_THREAD_N, GPTQ_MARLIN_MAX_PARALLEL, self.device
         )
         self.marlin_q_w = marlin_q_w
         self.marlin_s = marlin_s
@@ -215,7 +234,28 @@ class KLinearMarlin(KLinearBase):
         self.n = weight.shape[1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Only support input x as BF16 and FP16
+        # CPU实现路径
+        if self.use_cpu_fallback:
+            orig_shape = list(x.shape)
+            orig_dtype = x.dtype
+            
+            # 确保输入在CPU上
+            x = x.to(device=self.device, dtype=torch.float32)
+            
+            # 重塑以进行矩阵乘法
+            x = x.reshape(-1, orig_shape[-1])
+            
+            # 使用普通矩阵乘法
+            x = torch.matmul(x, self.weight)
+            
+            if self.has_bias:
+                x = x + self.bias
+                
+            # 恢复原始形状和类型
+            orig_shape[-1] = self.weight.shape[1]
+            return x.reshape(orig_shape).to(orig_dtype)
+        
+        # GPU实现路径（原代码）
         x = x.to(self.device)
         orig_shape = list(x.shape)
         orig_dtype = x.dtype
@@ -240,14 +280,17 @@ class KLinearMarlin(KLinearBase):
         return x.reshape(orig_shape).to(orig_dtype)
 
     def unload(self):
-
+        if self.use_cpu_fallback:
+            self.weight = None
+        else:
+            self.marlin_q_w = None
+            self.marlin_s = None
+            self.g_idx = None
+            self.sort_indices = None
+            self.workspace = None
+            
         if self.has_bias:
             self.bias = None
-        self.marlin_q_w = None
-        self.marlin_s = None
-        self.g_idx = None
-        self.sort_indices = None
-        self.workspace = None
 
 class KLinearCPUInfer(KLinearBase):
     CPU_INFER = CPUInfer(Config().cpu_infer)
