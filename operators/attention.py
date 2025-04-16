@@ -149,6 +149,9 @@ class KDeepseekV3Attention(BaseInjectedModule, DeepseekV3Attention):
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 
+        # 确保数据类型匹配o_proj的权重类型
+        attn_output = attn_output.to(dtype=self.o_proj.weight.dtype)
+
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights, past_key_value
@@ -346,6 +349,9 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         attn_output = attn_output.transpose(1, 2).contiguous()
 
         attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
+        # 确保数据类型匹配o_proj的权重类型
+        attn_output = attn_output.to(dtype=self.o_proj.weight.dtype)
 
         attn_output = self.o_proj(attn_output)
 
@@ -546,6 +552,7 @@ class KLlamaAttention(BaseInjectedModule):
             o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
             attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
+            attn_output = attn_output.to(dtype=self.o_proj.weight.dtype)
             attn_output = self.o_proj(attn_output)
 
         if not output_attentions:

@@ -162,7 +162,7 @@ def local_chat(
     gguf_path: str | None = None,
     max_new_tokens: int = 10,
     cpu_infer: int = Config().cpu_infer,
-    use_cuda_graph: bool = True,
+    use_cuda_graph: bool = False,
     prompt_file : str | None = None,
     mode: str = "normal",
 ):
@@ -258,7 +258,7 @@ def local_chat(
             torch.bfloat16
         )  # TODO: Remove this, replace dtype using config
         generated = prefill_and_generate(
-            model, tokenizer, input_tensor.cuda(), max_new_tokens, use_cuda_graph, mode
+            model, tokenizer, input_tensor, max_new_tokens, use_cuda_graph, mode
         )
         #return
 
