@@ -492,25 +492,25 @@ class KLlamaAttention(BaseInjectedModule):
         # 用 BF16（若 CPU & IPEX 支持），否则 FP32
         compute_dtype = torch.bfloat16 if has_ipex else torch.float32
 
-        # 打开自动混合精度；IPEX 会覆写 FlashAttention kernel
-        amp_ctx = torch.cpu.amp.autocast(dtype=compute_dtype, enabled=True)
+        # 打开自动混合精度；IPEX 会覆写 FlashAttention kernel
+        amp_ctx = torch.amp.autocast(dtype=compute_dtype, enabled=True)
 
         with amp_ctx:
-            bsz, q_len, _ = hidden_states.size()
-
+            bsz, q_len, hidden_size = hidden_states.size()
+            
             # ---- 1. QKV 投影 -----------------------------------------------------
-            # IPEX 会在 .optimize() 时预‑pack 权重，这里只需一次 F.linear
-            query_states = F.linear(hidden_states, self.q_proj.weight)
-            key_states   = F.linear(hidden_states, self.k_proj.weight)
-            value_states = F.linear(hidden_states, self.v_proj.weight)
+            # 使用原始模块的投影
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
 
             # [B, S, H*D] → [B, H, S, D]
             query_states = query_states.view(bsz, q_len, self.num_heads,
-                                             self.head_dim).transpose(1, 2)
-            key_states   = key_states.view(bsz, q_len, self.num_key_value_heads,
-                                           self.head_dim).transpose(1, 2)
+                                         self.head_dim).transpose(1, 2)
+            key_states = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                     self.head_dim).transpose(1, 2)
             value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
-                                             self.head_dim).transpose(1, 2)
+                                         self.head_dim).transpose(1, 2)
 
             # ---- 2. Rotary 位置编码 ---------------------------------------------
             if position_embeddings is None:
@@ -521,6 +521,17 @@ class KLlamaAttention(BaseInjectedModule):
             query_states, key_states = self.apply_rotary_pos_emb(
                 query_states, key_states, cos, sin
             )
+            
+            # ---- 处理多头注意力 (GQA/MQA) ----------------------------------------
+            # For GQA/MQA, we need to repeat k/v heads if num_heads != num_key_value_heads
+            if self.num_key_value_heads != self.num_heads:
+                # Calculate the repeat factor
+                head_repeat_factor = self.num_heads // self.num_key_value_heads
+                
+                # Repeat k/v heads to match query heads
+                # [B, KV_heads, S, D] -> [B, Q_heads, S, D]
+                key_states = key_states.repeat_interleave(head_repeat_factor, dim=1)
+                value_states = value_states.repeat_interleave(head_repeat_factor, dim=1)
 
             # ---- 3. Flash / SDPA -------------------------------------------------
             # `F.scaled_dot_product_attention` 输出同形状 [B, H, S, D]
@@ -535,7 +546,8 @@ class KLlamaAttention(BaseInjectedModule):
             attn_output = attn_output.transpose(1, 2).contiguous() \
                 .view(bsz, q_len, -1)
 
-            attn_output = F.linear(attn_output, self.o_proj.weight)
+            # 使用原始模块的输出投影
+            attn_output = self.o_proj(attn_output)
 
         attn_weights = None if not output_attentions else None  # 暂不回传权重
         return attn_output, attn_weights, past_key_value
