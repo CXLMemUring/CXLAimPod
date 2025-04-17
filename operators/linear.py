@@ -234,23 +234,42 @@ class KLinearMarlin(KLinearBase):
         self.n = weight.shape[1]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # CPU实现路径
         if self.use_cpu_fallback:
             orig_shape = list(x.shape)
             orig_dtype = x.dtype
-            
-            # 确保输入在CPU上
-            x = x.to(device=self.device, dtype=torch.float32)
-            
+
+            x = x.to(device=self.device, dtype=torch.int8)
+
             # 重塑以进行矩阵乘法
             x = x.reshape(-1, orig_shape[-1])
             
-            # 使用普通矩阵乘法
-            x = torch.matmul(x, self.weight)
-            
-            if self.has_bias:
-                x = x + self.bias
+            # 启用oneDNN后端以利用AMX指令
+            with torch.amp.autocast(enabled=True, dtype=torch.int8):
+                # 确保权重矩阵为bfloat16并且内存连续
+                weight = self.weight.to(torch.int8).contiguous()
                 
+                # 使用channels_last内存格式以提高AMX性能
+                torch._C._set_mkldnn_enabled(True)
+                
+                # 执行矩阵乘法，利用AMX指令
+                # 使用较大批次大小以最大化AMX tile利用率
+                batch_size = 32
+                result = []
+                
+                for i in range(0, x.size(0), batch_size):
+                    end = min(i + batch_size, x.size(0))
+                    # 将输入转为连续以确保最佳性能
+                    batch_x = x[i:end].contiguous()
+                    # 执行矩阵乘法
+                    batch_result = torch.matmul(batch_x, weight)
+                    result.append(batch_result)
+                
+                x = torch.cat(result, dim=0)
+                
+                # 添加偏置
+                if self.has_bias:
+                    x = x + self.bias.to(torch.int8)
+
             # 恢复原始形状和类型
             orig_shape[-1] = self.weight.shape[1]
             return x.reshape(orig_shape).to(orig_dtype)
@@ -321,8 +340,7 @@ class KLinearCPUInfer(KLinearBase):
             out_device = x.device
             self.input_tensor_cpu.copy_(x, non_blocking=True)
             qlen = origin_shape[1]
-            KLinearCPUInfer.CPU_INFER.submit_with_cuda_stream(
-                torch.cuda.current_stream().cuda_stream,
+            KLinearCPUInfer.CPU_INFER.submit(
                 self.linear.forward(
                     qlen, 
                     self.input_tensor_cpu.data_ptr(), 

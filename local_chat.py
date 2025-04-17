@@ -217,6 +217,15 @@ def local_chat(
     if model.generation_config.pad_token_id is None:
         model.generation_config.pad_token_id = model.generation_config.eos_token_id
     model.eval()
+    try:
+        import intel_extension_for_pytorch as ipex
+        model = ipex.optimize(
+            model,
+            dtype=torch.bfloat16,   # 触发 BF16 + AMX
+            inplace=True,
+        )
+    except:
+        pass
     logging.basicConfig(level=logging.INFO)
 
     system = platform.system()

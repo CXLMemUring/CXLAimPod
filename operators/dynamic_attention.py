@@ -23,6 +23,12 @@ from flash_attn import flash_attn_func, flash_attn_with_kvcache
 import math
 import json
 
+# 环境配置（在文件开头或初始化时添加）
+import os
+os.environ["ONEDNN_MAX_CPU_ISA"] = "AVX512_CORE_AMX"
+os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
+os.environ["ONEDNN_PRIMITIVE_CACHE_CAPACITY"] = "1024"
+torch.backends.mkldnn.enabled = True
 
 class DynamicScaledDotProductAttention:
     remaining_length: int
@@ -578,6 +584,10 @@ class DynamicScaledDotProductAttention:
         k_cache.copy_(k_cache_cpu)
         v_cache.copy_(v_cache_cpu)
 
+        # 强制内存连续
+        k_cache = k_cache.contiguous()
+        v_cache = v_cache.contiguous()
+
         return k_cache, v_cache
 
     def calc_anchor(self, cache_seqlens: int):
@@ -609,7 +619,7 @@ class DynamicScaledDotProductAttention:
             self.cpu_infer.sync()
 
     def clear_importance(self, cache_seqlens: int):
-        print(f"clear importance: {cache_seqlens}")
+        # print(f"clear importance: {cache_seqlens}")
         cur_block_num = (cache_seqlens + self.block_size - 1) // self.block_size
         block_table_cpu = self.prefix_block_table[:, :cur_block_num].to("cpu")
         cache_seqlens_cpu = torch.tensor(
@@ -744,47 +754,58 @@ class DynamicScaledDotProductAttention:
                     key,
                 )
 
-            # 执行标准注意力计算 (使用原始类型)
+            # 使用AMX优化的批处理矩阵乘法
             n_gqa = self.q_head_num // self.kv_head_num
             
-            # 准备输出数组
-            attn_output = torch.zeros_like(query_states)
+            # 重塑张量以利用AMX的tile计算
+            query = query_states.view(bsz, q_len, self.kv_head_num, n_gqa, self.head_dim)  # [bsz, q_len, kv, gqa, d]
+            key = key.permute(0, 2, 1, 3)  # [bsz, kv, seq_len, d]
+            value = value.permute(0, 2, 1, 3)  # [bsz, kv, seq_len, d]
+
+            # 获取实际序列长度
+            seq_len = key.size(2)  # 关键修改：使用key的实际序列长度
             
-            # 遍历每个批次、每个查询位置和注意力头
-            for b in range(bsz):
-                for q in range(q_len):
-                    for h in range(self.q_head_num):
-                        kv_head = h // n_gqa
-                        
-                        # 获取查询向量
-                        query = query_states[b, q, h].unsqueeze(0)  # [1, head_dim]
-                        
-                        # 获取有效长度内的键和值
-                        seq_len = past_len + q + 1
-                        key_seq = key[b, :seq_len, kv_head]  # [seq_len, head_dim]
-                        value_seq = value[b, :seq_len, kv_head]  # [seq_len, head_dim]
-                        
-                        # 计算注意力得分
-                        scores = torch.matmul(query, key_seq.transpose(0, 1)) / math.sqrt(self.head_dim)
-                        
-                        # 创建并应用causal mask
-                        mask = torch.ones(1, seq_len, device=device)
-                        mask = torch.tril(mask)
-                        mask = mask.bool()
-                        
-                        # 屏蔽掉不应该关注的token
-                        scores = scores.masked_fill(~mask, -10000.0)
-                        
-                        # 应用softmax得到注意力权重
-                        attn_weights = torch.nn.functional.softmax(scores, dim=-1)
-                        
-                        # 计算注意力加权的值向量
-                        context = torch.matmul(attn_weights, value_seq)
-                        
-                        # 存储结果
-                        attn_output[b, q, h] = context
+            # 创建4D因果mask (添加kv_head和gqa维度)
+            mask = torch.tril(torch.ones(
+                q_len, 
+                seq_len, 
+                dtype=torch.bool, 
+                device=device
+            )).view(1, q_len, 1, 1, seq_len)  # [1, q_len, 1, 1, seq_len]
+
+            # 使用内存连续格式
+            query = query.contiguous().to(torch.bfloat16)
+            key = key.contiguous().to(torch.bfloat16)
             
-            # 转置输出到预期的形状
+            # 批处理矩阵乘法
+            scores = torch.einsum('bqkgd,bksd->bqkgs', 
+                        query, 
+                        key) / math.sqrt(self.head_dim)
+            
+            # 扩展scores维度以匹配mask
+            scores = scores.view(bsz, q_len, self.kv_head_num, n_gqa, seq_len)
+            
+            # 应用mask（确保维度对齐）
+            scores = scores.masked_fill(~mask, -10000.0)
+
+            # 批处理softmax
+            attn_weights = torch.nn.functional.softmax(scores, dim=-1)
+            
+            # 使用AMX加速的矩阵乘法
+            with torch.backends.mkldnn.verbose(torch.backends.mkldnn.VERBOSE_ON):
+                context = torch.einsum('bqkgs,bksd->bqkgd', 
+                             attn_weights.to(torch.bfloat16),
+                             value.to(torch.bfloat16))
+            
+            # 重塑回原始形状（修复内存连续性）
+            context = context.contiguous()  # 添加连续性保证
+            attn_output = context.view(
+                bsz, 
+                q_len, 
+                self.q_head_num, 
+                self.head_dim
+            )
+            
             return attn_output.transpose(1, 2)
 
         elif mode == "generate":
@@ -902,6 +923,8 @@ class DynamicScaledDotProductAttention:
                     self.cpu_infer.sync()
                 #            print("submit_with_cuda_stream finished\n")
                 self.output_cuda.copy_(self.output_cpu, non_blocking=use_non_blocking)
+                # 强制内存连续
+                self.output_cuda = self.output_cuda.contiguous()
                 return self.output_cuda.transpose(1, 2)
 
     def save(self, path: str, length: int):
@@ -924,3 +947,10 @@ class DynamicScaledDotProductAttention:
             )
         )
         self.cpu_infer.sync()
+
+    def test_gradient(self, query, key, value):
+        # 梯度检查
+        torch.autograd.gradcheck(fn, (query, key, value), eps=1e-3, atol=1e-2)
+
+        # 数值精度验证
+        assert torch.allclose(orig_output, amx_output, atol=1e-3), "Numerical mismatch!"

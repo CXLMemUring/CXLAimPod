@@ -480,82 +480,62 @@ class KLlamaAttention(BaseInjectedModule):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
+    ):
+        # --- 0. IPEX 环境探测 ----------------------------------------------------
+        try:
+            import intel_extension_for_pytorch as ipex
+            has_ipex = True
+        except ImportError:
+            has_ipex = False
+            logger.warning("IPEX not found – fallback to vanilla PyTorch SDPA")
 
-        if self.config.pretraining_tp > 1:
-            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
-            query_slices = self.q_proj.weight.split(
-                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+        # 用 BF16（若 CPU & IPEX 支持），否则 FP32
+        compute_dtype = torch.bfloat16 if has_ipex else torch.float32
 
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
+        # 打开自动混合精度；IPEX 会覆写 FlashAttention kernel
+        amp_ctx = torch.cpu.amp.autocast(dtype=compute_dtype, enabled=True)
 
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
+        with amp_ctx:
+            bsz, q_len, _ = hidden_states.size()
 
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
+            # ---- 1. QKV 投影 -----------------------------------------------------
+            # IPEX 会在 .optimize() 时预‑pack 权重，这里只需一次 F.linear
+            query_states = F.linear(hidden_states, self.q_proj.weight)
+            key_states   = F.linear(hidden_states, self.k_proj.weight)
+            value_states = F.linear(hidden_states, self.v_proj.weight)
 
-        else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            # [B, S, H*D] → [B, H, S, D]
+            query_states = query_states.view(bsz, q_len, self.num_heads,
+                                             self.head_dim).transpose(1, 2)
+            key_states   = key_states.view(bsz, q_len, self.num_key_value_heads,
+                                           self.head_dim).transpose(1, 2)
+            value_states = value_states.view(bsz, q_len, self.num_key_value_heads,
+                                             self.head_dim).transpose(1, 2)
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            # ---- 2. Rotary 位置编码 ---------------------------------------------
+            if position_embeddings is None:
+                cos, sin = self.rotary_emb(value_states, position_ids)
+            else:
+                cos, sin = position_embeddings
 
-        if position_embeddings is None:
-
-            logger.warning(
-                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
-                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
-                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
-                "removed and `position_embeddings` will be mandatory."
-            )
-            cos, sin = self.rotary_emb(value_states, position_ids)
-        else:
-            cos, sin = position_embeddings
-        query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, cos, sin)
-        if q_len == 1:
-            position_ids = position_ids[0][-1].unsqueeze(0).unsqueeze(0)
-            query_states = query_states[:, :, -1:]
-            key_states = key_states[:, :, -1:]
-
-        attn_output = KLlamaModel.dynamic_sdpa.apply(
-            self.layer_idx,
-            bsz,
-            position_ids[0][0],
-            query_states.transpose(1, 2).to(torch.float16),
-            key_states.transpose(1, 2).to(torch.float16),
-            value_states.transpose(1, 2).to(torch.float16),
-            mode="prefill" if q_len > 1 else "generate",
-        )
-
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
+            query_states, key_states = self.apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
             )
 
-        attn_output = attn_output.transpose(1, 2).contiguous()
+            # ---- 3. Flash / SDPA -------------------------------------------------
+            # `F.scaled_dot_product_attention` 输出同形状 [B, H, S, D]
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_states, value_states,
+                attn_mask=attention_mask,
+                is_causal=True,
+                dropout_p=0.0,
+            )  # IPEX‑Flash‑CPU kernel 若满足 stride 条件将被激活
 
-        attn_output = attn_output.reshape(bsz, q_len, -1)
+            # ---- 4. 输出线性 & dtype 回退 ----------------------------------------
+            attn_output = attn_output.transpose(1, 2).contiguous() \
+                .view(bsz, q_len, -1)
 
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = attn_output.to(dtype=self.o_proj.weight.dtype)
-            attn_output = self.o_proj(attn_output)
+            attn_output = F.linear(attn_output, self.o_proj.weight)
 
-        if not output_attentions:
-            attn_weights = None
-
+        attn_weights = None if not output_attentions else None  # 暂不回传权重
         return attn_output, attn_weights, past_key_value
