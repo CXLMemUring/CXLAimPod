@@ -16,13 +16,15 @@ class BaseInjectedModule(nn.Module):
                  gguf_loader : GGUFLoader,
                  config: PretrainedConfig,
                  orig_module: nn.Module,
-                 device: str = "cpu",
+                 device: str,
                  **kwargs):
         nn.Module.__init__(self)
         nn.Module.__setattr__(self, "orig_module", orig_module)
         object.__setattr__(self, "key", key)
         object.__setattr__(self, "gguf_loader", gguf_loader)
         object.__setattr__(self, "config", config)
+        object.__setattr__(self, "prefill_device", device)
+        object.__setattr__(self, "generate_device", device)
         object.__setattr__(self, "device", device)
         
     def __getattr__(self, name: str) -> Any:
@@ -58,7 +60,3 @@ class BaseInjectedModule(nn.Module):
     def load(self):
         for name, child in self._modules.items():
             utils.load_weights(child, self.gguf_loader, self.key+".")
-
-    def warmup(self):
-        for _, child in self._modules.items():
-            utils.warmup(child)

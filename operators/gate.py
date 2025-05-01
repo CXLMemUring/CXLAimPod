@@ -1,25 +1,14 @@
-
-from typing import Any, Union
-import numpy as np
-import numpy.typing as npt
-from torch import Tensor, nn
-import torch.nn.functional as F
+from typing import Optional
+from torch import nn
 import torch
-import sys, os
+import torch.nn.functional as F
+import os
 from ktransformers.operators.base_operator import BaseInjectedModule
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Release"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "ktransformers_ext", "build", "Debug"))
-import cpuinfer_ext
-from cpuinfer_ext.moe import MOEConfig, MOE
-import ctypes
 from ktransformers.operators.base_operator import BaseInjectedModule
+from ktransformers.operators.linear import KTransformersLinear
 from ktransformers.util.custom_gguf import GGUFLoader
-from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
 from abc import ABC, abstractmethod
-import time
 
 
 # class Base(BaseInjectedModule, ABC):
@@ -44,7 +33,7 @@ class KMoEGateBase(ABC):
         pass
 
     @abstractmethod
-    def load(self, w: dict | nn.Parameter | tuple | None = None, device: str = "cpu"):
+    def load(self, w: dict | nn.Parameter | tuple | None = None, device: str = "cpu", warmup: bool = False):
         pass
     
     @abstractmethod
@@ -67,7 +56,14 @@ class KMoEGateBase(ABC):
 
         for key in keys:
             key = ".".join(key.split(".")[:-1])
-            if key + ".ffn_gate_inp.weight" in self.gguf_loader.tensor_info:
+            if self.gguf_loader.safetensor_loader is not None:
+                targets = [".ffn_gate_inp.weight", ".exp_probs_b.bias"]
+                weight = self.gguf_loader.safetensor_loader.load_tensor(key + ".ffn_gate_inp.weight") 
+                e_score_correction_bias = self.gguf_loader.safetensor_loader.load_tensor(key + ".exp_probs_b.bias")
+                weight_type = weight.dtype
+                e_score_correction_bias_type = e_score_correction_bias.dtype
+                res = {"weight": weight, "e_score_correction_bias": e_score_correction_bias,  "weight_type": weight_type, "e_score_correction_bias_type": e_score_correction_bias_type}
+            elif key + ".ffn_gate_inp.weight" in self.gguf_loader.tensor_info:
                 targets = [".ffn_gate_inp.weight", ".exp_probs_b.bias"]
                 tensors = self.load_multi(key, targets, device=device)
                 weight = tensors[".ffn_gate_inp.weight"]
@@ -97,7 +93,7 @@ class KMoEGate(BaseInjectedModule, KMoEGateBase):
         prefill_device: str = "cpu",
         **kwargs,
     ):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
         KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
         self.generate_device = generate_device
         self.prefill_device = prefill_device
@@ -116,8 +112,79 @@ class KMoEGate(BaseInjectedModule, KMoEGateBase):
             self.orig_module.e_score_correction_bias = nn.Parameter(w["e_score_correction_bias"])
         else:
             raise ValueError("Invalid weight type")
-        self.orig_module.weight = self.orig_module.weight.to(device)
-        self.orig_module.e_score_correction_bias = self.orig_module.e_score_correction_bias.to(device)
+        self.orig_module.weight = nn.Parameter(self.orig_module.weight.to(device))
+        self.orig_module.e_score_correction_bias = nn.Parameter(self.orig_module.e_score_correction_bias.to(device))
+
+    def unload(self):
+        if self.weight is not None:
+            self.weight = None
+        if self.e_score_correction_bias is not None:
+            self.e_score_correction_bias = None
+
+
+class KMoEGateQwen2Moe(BaseInjectedModule, KMoEGateBase):
+    def __init__(
+        self,
+        key: str,
+        gguf_loader: GGUFLoader,
+        config: PretrainedConfig,
+        orig_module: nn.Module = None,
+        generate_device: str = "cpu",
+        generate_op: str| None = "KLinearMarlin",
+        prefill_device: str = "cpu",
+        prefill_op: str| None = "KLinearMarlin",
+        use_quant: bool = False,
+        **kwargs,
+    ):
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
+        KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
+        self.generate_device = generate_device
+        self.prefill_device = prefill_device
+        self.generate_op = generate_op
+        self.prefill_op = prefill_op
+        self.is_windows = os.name == 'nt'
+        self.use_quant = use_quant
+        if not self.is_windows and use_quant:
+            self.gate_linear = nn.Linear(self.gating_dim, self.n_routed_experts, device=generate_device)
+            self.gate_linear = KTransformersLinear(key + ".ffn_gate_inp", 
+                                               gguf_loader, config, self.gate_linear, #orig_module
+                                               generate_device, generate_op, prefill_device, prefill_op)
+        else:
+            self.gate_linear = None
+
+    def forward(self, hidden_states) -> torch.Tensor:
+        if self.is_windows:
+            return self.orig_module.forward(hidden_states)
+        
+        bsz, seq_len, h = hidden_states.shape
+        ### compute gating score
+        hidden_states = hidden_states.view(-1, h)
+        if self.use_quant:
+            logits = self.gate_linear.forward(logits)
+        else:
+            logits = F.linear(
+                hidden_states.type(torch.float32), self.weight.type(torch.float32), None
+            )
+            
+        return grouped_topk(hidden_states, logits,
+                            self.top_k, self.norm_topk_prob,
+                            self.n_group, self.topk_group)
+
+    def load(self, w: dict | nn.Parameter | tuple | None = None, device: str|None = None):
+        if device is None: device = self.device
+        if w is None: w = self.load_weights(device=device)
+        
+        if isinstance(w, dict):
+            self.weight_type = w["weight_type"]
+            self.e_score_correction_bias_type = w["e_score_correction_bias_type"]
+            self.orig_module.weight = nn.Parameter(w["weight"])
+            self.orig_module.e_score_correction_bias = nn.Parameter(w["e_score_correction_bias"])
+        else:
+            raise ValueError("Invalid weight type")
+        self.orig_module.weight = nn.Parameter(self.orig_module.weight.to(device))
+        self.orig_module.e_score_correction_bias = nn.Parameter(self.orig_module.e_score_correction_bias.to(device))
+        if not self.is_windows and self.use_quant:
+            self.gate_linear.load(self.orig_module.weight)
 
     def unload(self):
         if self.weight is not None:

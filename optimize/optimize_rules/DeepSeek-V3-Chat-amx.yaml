@@ -1,10 +1,22 @@
 - match:
     class: ktransformers.models.modeling_deepseek_v3.DeepseekV3RotaryEmbedding
   replace:
-    class: ktransformers.operators.RoPE.RotaryEmbeddingV3
+    class: ktransformers.operators.RoPE.YarnRotaryEmbeddingV3
     kwargs:
       generate_device: "cpu"
       prefill_device: "cpu"
+
+- match:
+    name: "^lm_head$"  # regular expression 
+    class: torch.nn.Linear  # only match modules matching name and class simultaneously
+  replace:
+    class: ktransformers.operators.linear.KTransformersLinear  # optimized Kernel on quantized data types
+    kwargs:
+      generate_device: "cpu"
+      prefill_device: "cpu"
+      generate_op: "KLinearMarlin"
+      prefill_op: "KLinearTorch"
+
 - match:
     name: "^model\\.layers\\.(?!.*self_attn\\.kv_b_proj).*$"  # regular expression 
     class: torch.nn.Linear  # only match modules matching name and class simultaneously
@@ -40,7 +52,7 @@
       generate_device: "cpu"
       generate_op: "KExpertsCPU"
       out_device: "cpu"
-      backend: "AMXInt8" # or "AMXInt16" or "llamafile" (default)
+      backend: "AMXInt8" # or "AMXBF16" or "llamafile" (default)
   recursive: False # don't recursively inject submodules of this module
 - match:
     name: "^model\\.layers\\..*\\.self_attn$"
@@ -49,6 +61,7 @@
     kwargs:
       generate_device: "cpu"
       prefill_device: "cpu"
+      absorb_for_prefill: False # change this to True to enable long context(prefill may slower).
 - match:
     name: "^model$"
   replace:

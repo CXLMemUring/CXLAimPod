@@ -487,11 +487,9 @@ class Qwen2MoeFlashAttention2(Qwen2MoeAttention):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             # we slice the states for static kv cache to be supported in FA2. Not sure it's a must as compile fails
             # for bsz == 1, avoid using slice to capture cuda graph
-            """
             if cache_position is not None and q_len > 1:
                 key_states = key_states[:, :, : cache_position[-1] + 1, :]
                 value_states = value_states[:, :, : cache_position[-1] + 1, :]
-            """
 
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -629,22 +627,16 @@ class Qwen2MoeFlashAttention2(Qwen2MoeAttention):
             attn_output = pad_input(attn_output_unpad, indices_q, batch_size, query_length)
         else:
             if not use_sliding_windows:
-                position_ids = position_ids.to(dtype=torch.int32)[:, -1]
-                # print(query_states.shape)
-                # print(key_states.shape)
-                # print(value_states.shape)
-                # print(position_ids.shape)
-                # print(position_ids)
-                attn_output = flash_attn_with_kvcache(
-                    query_states,
-                    key_states,
-                    value_states,
-                    cache_seqlens=position_ids,
-                    softmax_scale=softmax_scale,
-                    causal=causal,
-                )
-                if True or query_length == 1:
-                    pass  
+                if query_length == 1:
+                    position_ids = position_ids.to(dtype=torch.int32).squeeze(1)
+                    attn_output = flash_attn_with_kvcache(
+                        query_states,
+                        key_states,
+                        value_states,
+                        cache_seqlens=position_ids,
+                        softmax_scale=softmax_scale,
+                        causal=causal,
+                    )   
                 else:
                     attn_output = flash_attn_func(
                         query_states,

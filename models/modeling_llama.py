@@ -81,7 +81,7 @@ class LlamaRotaryEmbedding(nn.Module):
         dim=None,
         max_position_embeddings=2048,
         base=10000,
-        device=None,
+        device="cpu",
         scaling_factor=1.0,
         rope_type="default",
         config: Optional[LlamaConfig] = None,

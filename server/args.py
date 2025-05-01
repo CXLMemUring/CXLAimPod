@@ -1,6 +1,6 @@
 import argparse
 from ktransformers.server.backend.args import ConfigArgs, default_args
-
+from ktransformers.util.utils import get_free_ports
 
 class ArgumentParser:
     def __init__(self, cfg):
@@ -10,26 +10,26 @@ class ArgumentParser:
         parser = argparse.ArgumentParser(prog="kvcache.ai", description="Ktransformers")
         parser.add_argument("--host", type=str, default=self.cfg.server_ip)
         parser.add_argument("--port", type=int, default=self.cfg.server_port)
+        parser.add_argument("--api_key", type=str, default=self.cfg.api_key)
         parser.add_argument("--ssl_keyfile", type=str)
         parser.add_argument("--ssl_certfile", type=str)
         parser.add_argument("--web", type=bool, default=self.cfg.mount_web)
         parser.add_argument("--model_name", type=str, default=self.cfg.model_name)
         parser.add_argument("--model_dir", type=str)
-        parser.add_argument("--model_path", type=str)
+        parser.add_argument("--model_path", type=str, default=self.cfg.model_path)
         parser.add_argument(
             "--device", type=str, default=self.cfg.model_device, help="Warning: Abandoning this parameter"
         )
+        parser.add_argument("--architectures", type=str, default=self.cfg.model_name)
         parser.add_argument("--gguf_path", type=str, default=self.cfg.gguf_path)
-        parser.add_argument("--optimize_config_path", default=self.cfg.optimize_config_path, type=str, required=False)
+        parser.add_argument("--optimize_config_path", default=None, type=str, required=False)
         parser.add_argument("--cpu_infer", type=int, default=self.cfg.cpu_infer)
-        parser.add_argument("--type", type=str, default=self.cfg.backend_type)
+        parser.add_argument("--backend_type", type=str, default=self.cfg.backend_type)
+        parser.add_argument("--chunk_size", type=int, default=self.cfg.chunk_size)
 
         # model configs
         # parser.add_argument("--model_cache_lens", type=int, default=self.cfg.cache_lens)  # int?
-        parser.add_argument("--paged", type=bool, default=self.cfg.paged)
-        parser.add_argument("--total_context", type=int, default=self.cfg.total_context)
         parser.add_argument("--max_batch_size", type=int, default=self.cfg.max_batch_size)
-        parser.add_argument("--max_chunk_size", type=int, default=self.cfg.max_chunk_size)
         parser.add_argument("--max_new_tokens", type=int, default=self.cfg.max_new_tokens)
         parser.add_argument("--json_mode", type=bool, default=self.cfg.json_mode)
         parser.add_argument("--healing", type=bool, default=self.cfg.healing)
@@ -61,7 +61,6 @@ class ArgumentParser:
         parser.add_argument("--repetition_penalty", type=float, default=self.cfg.repetition_penalty)
         parser.add_argument("--frequency_penalty", type=float, default=self.cfg.frequency_penalty)
         parser.add_argument("--presence_penalty", type=float, default=self.cfg.presence_penalty)
-        parser.add_argument("--max_response_tokens", type=int, default=self.cfg.max_response_tokens)
         parser.add_argument("--response_chunk", type=int, default=self.cfg.response_chunk)
         parser.add_argument("--no_code_formatting", type=bool, default=self.cfg.no_code_formatting)
         parser.add_argument("--cache_8bit", type=bool, default=self.cfg.cache_8bit)
@@ -71,6 +70,9 @@ class ArgumentParser:
         parser.add_argument("--amnesia", type=bool, default=self.cfg.amnesia)
         parser.add_argument("--batch_size", type=int, default=self.cfg.batch_size)
         parser.add_argument("--cache_lens", type=int, default=self.cfg.cache_lens)
+
+        # kvc2 config
+        parser.add_argument("--kvc2_config_dir", type=str, default=self.cfg.kvc2_config_dir)
 
         # log configs
         # log level: debug, info, warn, error, crit
@@ -90,6 +92,8 @@ class ArgumentParser:
         # user config
         parser.add_argument("--user_secret_key", type=str, default=self.cfg.user_secret_key)
         parser.add_argument("--user_algorithm", type=str, default=self.cfg.user_algorithm)
+        parser.add_argument("--force_think", action=argparse.BooleanOptionalAction, type=bool, default=self.cfg.user_force_think)
+        parser.add_argument("--use_cuda_graph", action=argparse.BooleanOptionalAction, type=bool, default=self.cfg.use_cuda_graph)
 
         # web config
         parser.add_argument("--web_cross_domain", type=bool, default=self.cfg.web_cross_domain)
@@ -99,6 +103,18 @@ class ArgumentParser:
         parser.add_argument("--assistant_store_dir", type=str, default=self.cfg.assistant_store_dir)
         # local chat
         parser.add_argument("--prompt_file", type=str, default=self.cfg.prompt_file)
+
+
+        # async server
+        parser.add_argument("--sched_strategy", type=str, default=self.cfg.sched_strategy)
+        # parser.add_argument("--sched_port", type=int, default=self.cfg.sched_port)
+        # parser.add_argument("--sched_metrics_port", type=int, default=self.cfg.sched_metrics_port)
+        # parser.add_argument("--kvc2_metrics_port", type=int, default=self.cfg.kvc2_metrics_port)
+        parser.add_argument("--page_size", type=str, default=self.cfg.page_size)
+        parser.add_argument("--memory_gpu_only", type=str, default=self.cfg.memory_gpu_only)
+        parser.add_argument("--utilization_percentage", type=str, default=self.cfg.utilization_percentage)
+        parser.add_argument("--cpu_memory_size_GB", type=str, default=self.cfg.cpu_memory_size_GB)
+
 
         args = parser.parse_args()
         if (args.model_dir is not None or args.model_path is not None):
@@ -120,5 +136,15 @@ class ArgumentParser:
         self.cfg.mount_web = args.web
         self.cfg.server_ip = args.host
         self.cfg.server_port = args.port
-        self.cfg.backend_type = args.type
+        self.cfg.user_force_think = args.force_think
+        
+        args.gpu_memory_size = 4*1024*1024*1024 # TODO: set this to the actual GPU memory size
+        self.cfg.gpu_memory_size = args.gpu_memory_size
+        free_ports = get_free_ports(3, [args.port])
+        args.sched_port = free_ports[0]
+        args.sched_metrics_port = free_ports[1]
+        args.kvc2_metrics_port = free_ports[2]
+        self.cfg.sched_port = free_ports[0]
+        self.cfg.sched_metrics_port = free_ports[1]
+        self.cfg.kvc2_metrics_port = free_ports[2]
         return args

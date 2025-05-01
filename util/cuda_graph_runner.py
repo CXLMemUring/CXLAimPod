@@ -32,8 +32,6 @@ class CUDAGraphRunner:
         self.model = model
         inputs_embeds = model.model.embed_tokens(cur_token.to("cpu")).to(main_device)
         # torch.cuda.set_device can't set "cpu", must have a index
-        if main_device == "cpu":
-            main_device = "cpu"
         torch.cuda.set_device(main_device)
         self.main_device = main_device
         capture_stream = torch.cuda.Stream()
@@ -69,10 +67,8 @@ class CUDAGraphRunner:
         # Copy the input tensors to the input buffers.
         inputs_embeds = self.model.model.embed_tokens(cur_token.to("cpu"))
         self.input_buffers["inputs_embeds"].copy_(inputs_embeds)
-        if self.input_buffers["position_ids"] is not None:
-            self.input_buffers["position_ids"].copy_(position_ids)
-        if self.input_buffers["cache_position"] is not None:
-            self.input_buffers["cache_position"].copy_(cache_position)
+        self.input_buffers["position_ids"].copy_(position_ids)
+        self.input_buffers["cache_position"].copy_(cache_position)
 
         # Run the graph.
         #print("begin replay")

@@ -13,7 +13,7 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 # from operators import BaseInjectedModule
 from ktransformers.util.custom_gguf import GGUFLoader, translate_name_to_gguf
-from ktransformers.util.utils import set_module, load_weights, warmup
+from ktransformers.util.utils import set_module, load_weights
 import itertools
 import copy
 
@@ -124,10 +124,11 @@ def optimize_and_load_gguf(module: nn.Module, rule_file: str, gguf_path: str, mo
     model_config = translate_model_config(model_config)
 
     gguf_loader=GGUFLoader(gguf_path)
-    with torch.device("meta"):
+    with torch.device("cpu"):
         inject(module, optimize_config, model_config, gguf_loader)
+    # pre load lm_head because its big inter result
+    load_weights(module.lm_head, gguf_loader, "lm_head.")
     load_weights(module, gguf_loader)
-    warmup(module)
     module.gguf_loader = gguf_loader
     del_meta(module)
     torch.cuda.empty_cache()

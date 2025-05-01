@@ -1,15 +1,18 @@
 from typing import List, Optional
 from enum import Enum
-
-from pydantic import BaseModel
-
+from pydantic import BaseModel, Field
+from ktransformers.server.config.config import Config
 from ..base import Object
 
 class CompletionCreate(BaseModel):
     model: str
     prompt: str | List[str]
     stream: bool = False
-
+    temperature: Optional[float] = Field(default=Config().temperature)
+    top_p: Optional[float] = Field(default=Config().top_p)
+    max_tokens: Optional[int] = Field(default=None)
+    max_completion_tokens: Optional[int] = Field(default=None)
+    
     def get_tokenizer_messages(self):
         if isinstance(self.prompt,List):
             self.get_tokenizer_messages('\n'.join(self.prompt))

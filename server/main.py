@@ -5,20 +5,14 @@ from fastapi.staticfiles import StaticFiles
 import uvicorn.logging
 import uvicorn
 import sys
-
 project_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-sys.path.insert(0, project_dir)
 from fastapi.middleware.cors import CORSMiddleware
 from ktransformers.server.args import ArgumentParser
 from ktransformers.server.config.config import Config
-from ktransformers.server.utils.create_interface import create_interface
-from ktransformers.server.backend.args import default_args
+from ktransformers.server.utils.create_interface import create_interface, GlobalInterface
 from fastapi.openapi.utils import get_openapi
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-
 from ktransformers.server.api import router, post_db_creation_operations
 from ktransformers.server.utils.sql_utils import Base, SQLUtil
 from ktransformers.server.config.log import logger
@@ -34,7 +28,10 @@ def mount_app_routes(mount_app: FastAPI):
 
 def create_app():
     cfg = Config()
-    app = FastAPI()
+    if(hasattr(GlobalInterface.interface, "lifespan")):
+        app = FastAPI(lifespan=GlobalInterface.interface.lifespan)
+    else:
+        app = FastAPI()
     if Config().web_cross_domain:
         app.add_middleware(
             CORSMiddleware,
@@ -105,13 +102,14 @@ def custom_openapi(app):
 
 def main():
     cfg = Config()
+
     arg_parser = ArgumentParser(cfg)
 
-    # 初始化消息
     args = arg_parser.parse_args()
+    create_interface(config=cfg, default_args=cfg)
     app = create_app()
     custom_openapi(app)
-    create_interface(config=cfg, default_args=cfg)
+
     run_api(
         app=app,
         host=args.host,
@@ -119,7 +117,6 @@ def main():
         ssl_keyfile=args.ssl_keyfile,
         ssl_certfile=args.ssl_certfile,
     )
-
 
 if __name__ == "__main__":
     main()
