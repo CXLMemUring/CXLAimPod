@@ -485,14 +485,10 @@ def dequantize_q2_k(data):
     return d * (scales & 15) * (tmp & 3) - dmin * (scales >> 4)
 
 def dequantize_q2_k_gpu(data, device:str ="cpu", target_dtype = torch.get_default_dtype()):
-    block_size = GGML_BLOCK_SIZES["Q2_K"]
-    ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q2_K"]
-    data = np.frombuffer(data, dtype=data.dtype)
-    device = torch.device(device)
-    # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable, 
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_q2_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    values = dequantize_q2_k(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q3_k(data):
     # C implementation
@@ -537,14 +533,10 @@ def dequantize_q3_k(data):
     ], axis=1)
 
 def dequantize_q3_k_gpu(data, device:str ="cpu", target_dtype = torch.get_default_dtype()):
-    block_size = GGML_BLOCK_SIZES["Q3_K"]
-    ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q3_K"]
-    data = np.frombuffer(data, dtype=data.dtype)
-    device = torch.device(device)
-    # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable, 
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_q3_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    values = dequantize_q3_k(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q4_k(data):
     # C implementation
@@ -569,14 +561,10 @@ def dequantize_q4_k(data):
     return factors * qs2 - offsets
 
 def dequantize_q4_k_gpu(data, device:str ="cpu", target_dtype = torch.get_default_dtype()):
-    block_size = GGML_BLOCK_SIZES["Q4_K"]
-    ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q4_K"]
-    data = np.frombuffer(data, dtype=data.dtype)
-    device = torch.device(device)
-    # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable, 
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_q4_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    values = dequantize_q4_k(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q5_k(data):
     # C implementation
@@ -635,14 +623,10 @@ def dequantize_q5_k(data):
     ], axis=1)
 
 def dequantize_q5_k_gpu(data, device:str ="cpu", target_dtype = torch.get_default_dtype()):
-    block_size = GGML_BLOCK_SIZES["Q5_K"]
-    ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q5_K"]
-    data = np.frombuffer(data, dtype=data.dtype)
-    device = torch.device(device)
-    # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable, 
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_q5_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    values = dequantize_q5_k(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q6_k(data):
     # C implementation
@@ -696,20 +680,25 @@ def dequantize_q6_k_gpu(data: np.ndarray, device:str = "cpu", target_dtype = tor
     block_size = GGML_BLOCK_SIZES["Q6_K"]
     ele_per_blk = GGML_ELEMENTS_PER_BLOCK["Q6_K"]
     data = np.frombuffer(data, dtype=data.dtype)
-    device = torch.device(device)
     
-    # Fall back to CPU implementation if not using CUDA
-    if device.type != "cuda":
+    # Always use CPU implementation for CPU devices
+    if "cpu" in device.lower():
         values = dequantize_q6_k(data)
         values = torch.from_numpy(values.copy())
         values = values.to(device=device, dtype=target_dtype)
         return values
     
     # Use CUDA implementation for CUDA devices
-    # TODO: this and from_numpy in other functions will cause a warning saying that numpy is not writable, 
-    # the best way to fix this is transfer ptr to KTransformersOps instead of Tensor.
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_q6_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    device_obj = torch.device(device)
+    if device_obj.type == "cuda":
+        c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
+        return KTransformersOps.dequantize_q6_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    
+    # Fall back to CPU implementation for other devices
+    values = dequantize_q6_k(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 kvalues_iq4nl = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], dtype=np.int8)
 
@@ -744,13 +733,10 @@ def dequantize_iq4_xs(data):
     return y.flatten()
 
 def dequantize_iq4_xs_gpu(data: np.ndarray, device:str = "cpu", target_dtype = torch.get_default_dtype()):
-    block_size = GGML_BLOCK_SIZES["IQ4_XS"]
-    ele_per_blk = GGML_ELEMENTS_PER_BLOCK["IQ4_XS"]
-    device = torch.device(device)
-    num_blocks = len(data) // block_size
-    data = np.frombuffer(data, dtype=data.dtype)
-    c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
-    return KTransformersOps.dequantize_iq4_xs(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
+    values = dequantize_iq4_xs(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q4_0(data):
     # C implementation
@@ -795,7 +781,10 @@ def dequantize_q5_0(data):
     ], axis=1)
 
 def dequantize_q5_0_gpu(data, device:str = "cpu", target_dtype = torch.get_default_dtype()):
-    raise NotImplementedError()
+    values = dequantize_q5_0(data)
+    values = torch.from_numpy(values.copy())
+    values = values.to(device=device, dtype=target_dtype)
+    return values
 
 def dequantize_q8_0(data):
     # C struct definition

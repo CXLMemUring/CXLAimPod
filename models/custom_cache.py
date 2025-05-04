@@ -194,6 +194,21 @@ class StaticCache(transformers.StaticCache):
         """Returns the maximum shape of the cache."""
         return self.max_cache_len
 
+    def get_layer_cache(self, layer_idx: int):
+        """
+        Returns the key and value cache for a specific layer.
+        
+        Parameters:
+            layer_idx (`int`): The index of the layer to get the cache for.
+            
+        Returns:
+            A tuple containing the key and value cache for the specified layer.
+        """
+        if self.is_MLA:
+            return self.key_cache[layer_idx], self.page_table_list[layer_idx]
+        else:
+            return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
 class KDeepSeekV3Cache(nn.Module):
     def __init__(
         self,
