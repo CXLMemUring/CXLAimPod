@@ -58,6 +58,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                  generate_device: str = "cpu",
                  chunck_size: int = 1000,
                  absorb_for_prefill: bool = False,
+                 device: str = "cpu",
                  **kwargs):
         BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device,  **kwargs)
         self.orig_module.__init__(orig_module.config,
@@ -703,7 +704,7 @@ class KLlamaAttention(BaseInjectedModule):
                  prefill_device: str = "cpu",
                  generate_device: str = "cpu",
                  **kwargs):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
         self.orig_module.__init__(orig_module.config,
             orig_module.layer_idx)
     def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):

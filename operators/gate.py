@@ -93,8 +93,8 @@ class KMoEGate(BaseInjectedModule, KMoEGateBase):
         prefill_device: str = "cpu",
         **kwargs,
     ):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
-        KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
+        KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
         self.generate_device = generate_device
         self.prefill_device = prefill_device
 

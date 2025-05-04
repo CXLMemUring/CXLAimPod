@@ -1009,8 +1009,53 @@ class KLlamaModel(BaseInjectedModule):
         config_path: str = os.path.join(localstore_path,Config.CONFIG_FILE_NAME)
         with open(config_path,"r") as file:
             config_yaml = yaml.safe_load(file.read())
-            self.long_context_config = config_yaml.get("long_context")
-            self.ext_config = config_yaml.get("ext")
+            self.long_context_config = config_yaml.get("long_context", {})
+            self.ext_config = config_yaml.get("ext", {})
+            
+            # 确保所有必需的键都有默认值
+            if "chunk_size" not in self.long_context_config:
+                print("Warning: 'chunk_size' not found in long_context_config, using default value of 16384")
+                self.long_context_config["chunk_size"] = 16384
+                
+            # 其他可能需要默认值的键
+            defaults = {
+                "max_seq_len": 32768,
+                "block_size": 128,
+                "local_windows_len": 256,
+                "second_select_num": 128,
+                "anchor_type": "token",
+                "kv_type": "FP16",
+                "dense_layer_num": 1,
+                "anchor_num": 128,
+                "preselect_block": True,
+                "head_select_mode": "count",
+                "preselect_block_count": 96,
+                "layer_step": 3,
+                "token_step": 0,
+            }
+            
+            # 设置默认值
+            for key, value in defaults.items():
+                if key not in self.long_context_config:
+                    print(f"Warning: '{key}' not found in long_context_config, using default value: {value}")
+                    self.long_context_config[key] = value
+                    
+            # 确保ext_config也有必需的键
+            if "cpu_infer" not in self.ext_config:
+                print("Warning: 'cpu_infer' not found in ext_config, using default value of 1")
+                self.ext_config["cpu_infer"] = 1
+                
+            # 确保数字类型的参数是整数
+            for key in ["max_seq_len", "block_size", "local_windows_len", "second_select_num", 
+                        "dense_layer_num", "anchor_num", "preselect_block_count", "layer_step", 
+                        "token_step", "chunk_size", "cpu_infer"]:
+                if key in self.long_context_config:
+                    try:
+                        self.long_context_config[key] = int(self.long_context_config[key])
+                    except (TypeError, ValueError):
+                        default = defaults.get(key, 0)
+                        print(f"Warning: '{key}' value is not a valid integer, using default: {default}")
+                        self.long_context_config[key] = default
 
         KLlamaModel.dynamic_sdpa = DynamicScaledDotProductAttention(
             max_seq_len=self.long_context_config["max_seq_len"],
@@ -1028,7 +1073,7 @@ class KLlamaModel(BaseInjectedModule):
             block_selection_mode=self.long_context_config["head_select_mode"],
             preselect_block_count=self.long_context_config["preselect_block_count"],
             layer_step=self.long_context_config["layer_step"],
-            token_step=self.long_context_config["token_step"],
+            token_step=0 if self.long_context_config["token_step"] is None else self.long_context_config["token_step"],
             prefill_chunk_size=self.long_context_config["chunk_size"],
             use_attn_sparsity=False,
         )

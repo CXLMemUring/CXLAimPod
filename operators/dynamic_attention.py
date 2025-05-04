@@ -201,7 +201,7 @@ class DynamicScaledDotProductAttention:
             kv_type=self.kv_type,
             retrieval_type=self.block_selection_mode,
             layer_step=self.layer_step,
-            token_step=self.token_step,
+            token_step=0 if self.token_step is None else self.token_step,
             layer_offset=self.dense_layer_num % self.layer_step,
             max_batch_size=1,
             max_block_num=self.block_num,

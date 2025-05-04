@@ -30,7 +30,7 @@ def inject(module, local_optimization_dict, model_config:AutoConfig ,gguf_loader
                     import_class_name = import_path[-1]
                     module_cls=getattr(__import__(import_module_name, fromlist=[""]), import_class_name)
                     print(f"Injecting {child_prefix} as", import_module_name, ".", import_class_name)
-                    inject_module=module_cls(key = inject_module_meta["key"], gguf_loader = gguf_loader, config = model_config, orig_module=child, **inject_module_meta["kwargs"])
+                    inject_module=module_cls(key = inject_module_meta["key"], gguf_loader = gguf_loader, config = model_config, orig_module=child, device = "cpu", **inject_module_meta["kwargs"])
                     set_module(module, name, inject_module)
                 elif inject_module_meta["class"] == "default":
                     print(f"Injecting {child_prefix} as default")

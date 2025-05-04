@@ -14,7 +14,7 @@
     kwargs:
       generate_device: "cpu"
       prefill_device: "cpu"
-      generate_op: "KLinearTorch"
+      generate_op: "KLinearMarlin"
       prefill_op: "KLinearTorch"
 
 - match:
@@ -25,7 +25,7 @@
     kwargs:
       generate_device: "cpu"
       prefill_device: "cpu"
-      generate_op: "KLinearTorch"
+      generate_op: "KLinearMarlin"
       prefill_op: "KLinearTorch"
 - match:
     name: "^model\\.layers\\..*\\.mlp$"
@@ -38,10 +38,10 @@
 - match:
     class: ktransformers.models.modeling_deepseek_v3.MoEGate
   replace:
-    class: ktransformers.operators.gate.KMoEGateDeepSeekV3
+    class: ktransformers.operators.gate.KMoEGate
     kwargs:
-      generate_device: "cpu:0"
-      prefill_device: "cpu:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 - match:
     name: "^model\\.layers\\..*\\.mlp\\.experts$"
   replace:
@@ -52,6 +52,7 @@
       generate_device: "cpu"
       generate_op: "KExpertsCPU"
       out_device: "cpu"
+      backend: "AMXInt8" # or "AMXBF16" or "llamafile" (default)
   recursive: False # don't recursively inject submodules of this module
 - match:
     name: "^model\\.layers\\..*\\.self_attn$"

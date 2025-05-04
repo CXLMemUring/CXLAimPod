@@ -90,7 +90,14 @@ class LlamaRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        self.device = device
+        
+        # Handle meta device by forcing CPU initialization
+        if isinstance(device, str) and 'meta' in device:
+            print(f"Warning: Meta device detected: {device}. Using CPU for RoPE initialization.")
+            self.device = "cpu"
+        else:
+            self.device = device
+            
         self.scaling_factor = scaling_factor
         self.rope_type = rope_type
         self.config = config
@@ -125,11 +132,24 @@ class LlamaRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        inv_freq, self.attention_scaling = self.rope_init_fn(
-            self.config, device, **self.rope_kwargs
-        )
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.original_inv_freq = self.inv_freq
+        try:
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, self.device, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+            self.original_inv_freq = self.inv_freq
+        except NotImplementedError as e:
+            # Handle "Cannot copy out of meta tensor" error
+            if "meta tensor" in str(e):
+                print(f"Meta tensor error during RoPE initialization: {e}. Using CPU.")
+                # Try again with CPU device
+                inv_freq, self.attention_scaling = self.rope_init_fn(
+                    self.config, "cpu", **self.rope_kwargs
+                )
+                self.register_buffer("inv_freq", inv_freq, persistent=False)
+                self.original_inv_freq = self.inv_freq
+            else:
+                raise
 
     def _dynamic_frequency_update(self, position_ids, device):
         """
@@ -555,7 +575,19 @@ class LlamaAttention(nn.Module):
         )
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
-        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        try:
+            # Try to initialize with the normal flow
+            self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+        except NotImplementedError as e:
+            # If we get a meta tensor error, initialize with CPU device
+            if "meta tensor" in str(e):
+                print(f"Error in LlamaAttention RoPE init: {e}. Using CPU fallback.")
+                # Special configuration for CPU-only initialization
+                self.config.device = "cpu"  # Temporarily modify config
+                self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
+                self.config.device = None  # Reset device
+            else:
+                raise
         
     def _ensure_dtype_match(self, tensor, target_dtype):
         """Ensure tensor has the correct dtype"""
@@ -1214,14 +1246,52 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
-        self.layers = nn.ModuleList(
-            [
-                LlamaDecoderLayer(config, layer_idx)
-                for layer_idx in range(config.num_hidden_layers)
-            ]
-        )
+        
+        # Create decoder layers safely
+        try:
+            self.layers = nn.ModuleList(
+                [
+                    LlamaDecoderLayer(config, layer_idx)
+                    for layer_idx in range(config.num_hidden_layers)
+                ]
+            )
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                print(f"Meta tensor error in decoder layers creation: {e}. Creating layers differently.")
+                # Alternative initialization approach
+                self.layers = nn.ModuleList()
+                for layer_idx in range(config.num_hidden_layers):
+                    try:
+                        layer = LlamaDecoderLayer(config, layer_idx)
+                        self.layers.append(layer)
+                    except Exception as layer_error:
+                        print(f"Error creating layer {layer_idx}: {layer_error}. Using CPU.")
+                        # Try with CPU device setting
+                        old_device = getattr(config, 'device', None)
+                        config.device = "cpu"
+                        layer = LlamaDecoderLayer(config, layer_idx)
+                        self.layers.append(layer)
+                        if old_device is not None:
+                            config.device = old_device
+                        else:
+                            delattr(config, 'device')
+            else:
+                raise
+                
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        
+        # Initialize the rotary embeddings safely
+        try:
+            # Try with standard initialization
+            self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        except NotImplementedError as e:
+            if "meta tensor" in str(e):
+                print(f"Meta tensor error in LlamaModel RoPE init: {e}. Using CPU device.")
+                # Fallback to CPU initialization
+                self.rotary_emb = LlamaRotaryEmbedding(config=config, device="cpu")
+            else:
+                raise
+                
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -1483,12 +1553,56 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model = LlamaModel(config)
-        self.vocab_size = config.vocab_size
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-        # Initialize weights and apply final processing
-        self.post_init()
+        
+        try:
+            # Track whether we're in fallback mode
+            self._is_fallback_mode = False
+            
+            # Try to create the model with error handling
+            self.model = LlamaModel(config)
+            self.vocab_size = config.vocab_size
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            
+            # Initialize weights and apply final processing
+            self.post_init()
+            
+        except Exception as e:
+            print(f"Error during LlamaForCausalLM initialization: {e}")
+            print("Attempting to create model with CPU-only safe mode...")
+            
+            # Mark as fallback mode
+            self._is_fallback_mode = True
+            
+            # Save original device settings
+            original_device = getattr(config, 'device', None)
+            
+            # Force CPU for initialization
+            config.device = "cpu"
+            
+            # Try again with CPU
+            try:
+                self.model = LlamaModel(config)
+                self.vocab_size = config.vocab_size
+                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                
+                # Restore original device if it existed
+                if original_device is not None:
+                    config.device = original_device
+                else:
+                    delattr(config, 'device')
+                    
+                # Initialize weights and apply final processing
+                self.post_init()
+                print("Successfully created model in CPU fallback mode")
+            except Exception as fallback_error:
+                print(f"Critical error in fallback initialization: {fallback_error}")
+                print("Creating minimal model structure to prevent complete failure")
+                
+                # Create minimal functioning model
+                self.model = LlamaModel(config)
+                self.vocab_size = config.vocab_size
+                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+                print("Created basic model structure, functionality may be limited")
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

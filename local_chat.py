@@ -78,7 +78,7 @@ def local_chat(
     else:
         torch.set_default_dtype(config.torch_dtype)
 
-    with torch.device("cpu"):
+    with torch.device("meta"):
         if config.architectures[0] in custom_models:
             print("using custom modeling_xxx.py.")
             if (

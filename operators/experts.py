@@ -43,7 +43,7 @@ def deduplicate_and_sort(lst):
 cuda_graphs = deduplicate_and_sort([1, 2, 3, Config().max_batch_size, 64, Config().chunk_size])
 # class Base(BaseInjectedModule, ABC):
 class KExpertsBase(ABC):
-    def __init__(self, key: str, gguf_loader: GGUFLoader, config: PretrainedConfig, orig_module: nn.Module, device: str = "cpu", **kwargs):
+    def __init__(self, key: str, gguf_loader: GGUFLoader, config: PretrainedConfig, orig_module: nn.Module, device: str = "cuda", **kwargs):
         # super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
         self.key = key
         self.gguf_loader = gguf_loader
@@ -134,7 +134,7 @@ class KExpertsCPU(KExpertsBase):
         n_routed_experts: int,
         orig_module: nn.Module = None,
         device: str = "cpu",
-        out_device: str = "cpu", # this device mean which device the output should on. TODO: support cpu.
+        out_device: str = "cuda", # this device mean which device the output should on. TODO: support cpu.
         **kwargs
     ):
         super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
@@ -153,6 +153,26 @@ class KExpertsCPU(KExpertsBase):
         self.gate_type = w["gate_type"]
         self.up_type = w["up_type"]
         self.down_type = w["down_type"]
+        
+        # Convert tensors to I8 if using AMXInt8 backend
+        if self.backend == "AMXInt8":
+            from ktransformers.util.custom_gguf import GGMLQuantizationType, convert_to_i8
+            # Convert tensors to I8 format
+            if self.gate_type != GGMLQuantizationType.I8:
+                print(f"Converting gate tensor from {self.gate_type} to int8")
+                self.gate = convert_to_i8(self.gate)
+                self.gate_type = GGMLQuantizationType.I8
+            
+            if self.up_type != GGMLQuantizationType.I8:
+                print(f"Converting up tensor from {self.up_type} to int8")
+                self.up = convert_to_i8(self.up)
+                self.up_type = GGMLQuantizationType.I8
+            
+            if self.down_type != GGMLQuantizationType.I8:
+                print(f"Converting down tensor from {self.down_type} to int8")
+                self.down = convert_to_i8(self.down)
+                self.down_type = GGMLQuantizationType.I8
+        
         gate_ptr = ctypes.addressof(
             ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
         )
@@ -204,9 +224,9 @@ class KExpertsCPU(KExpertsBase):
             self.cpu_infer.sync()
         elif self.backend == "AMXInt8":
             from cpuinfer_ext.moe import AMX_MOEConfig, AMXInt8_MOE
-            assert self.gate_type == GGMLQuantizationType.BF16
-            assert self.up_type == GGMLQuantizationType.BF16
-            assert self.down_type == GGMLQuantizationType.BF16
+            assert self.gate_type == GGMLQuantizationType.I8
+            assert self.up_type == GGMLQuantizationType.I8
+            assert self.down_type == GGMLQuantizationType.I8
             moe_config = AMX_MOEConfig(
                 n_routed_experts,
                 self.config.num_experts_per_tok,
@@ -374,7 +394,7 @@ class KExpertsMarlin(KExpertsBase):
         config: PretrainedConfig,
         n_routed_experts: int,
         orig_module: nn.Module = None,
-        device: str = "cpu",
+        device: str = "cuda",
         **kwargs
     ):
         super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
@@ -619,14 +639,14 @@ class KTransformersExperts(BaseInjectedModule, KExpertsBase):
                  gguf_loader: GGUFLoader,
                  config: PretrainedConfig,
                  orig_module: nn.Module,
-                #  device: str = "cpu",
+                 device: str = "cpu",
                  prefill_device:str = "cpu",
                  prefill_op: str | None = "KExpertsTorch",
                  generate_device: str = "cpu",
                  generate_op: str | None = "KExpertsCPU",
                  **kwargs):
         BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
-        KExpertsBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
+        KExpertsBase.__init__(self, key, gguf_loader, config, orig_module, device, **kwargs)
         if generate_op is not None:
             self.generate_experts = EXPERTS_MAP[generate_op](key, gguf_loader, config, len(orig_module), device=generate_device, **kwargs)
         else:
@@ -1203,8 +1223,8 @@ class KTransformersExpertsV2(BaseInjectedModule, KExpertsBase):
                  gguf_loader: GGUFLoader,
                  config: PretrainedConfig,
                  orig_module: nn.Module,
-                #  device: str = "cpu",
-                 prefill_device:str = "cpu",
+                #  device: str = "cuda",
+                 prefill_device:str = "cuda",
                  prefill_op: str | None = "KExpertsTorch",
                  generate_device: str = "cpu",
                  generate_op: str | None = "KExpertsCPU",
@@ -1384,13 +1404,13 @@ class KQwen2MoeSparseMoeBlockV2(BaseInjectedModule, Qwen2MoeSparseMoeBlock):
         return final_out
 
 class KQwen3MoeSparseMoeBlockV2(BaseInjectedModule, Qwen3MoeSparseMoeBlock):
-    def forward(self, hidden_states, bsz_tensor, cuda_graph_idx=0):
+    def forward(self, hidden_states, cuda_graph_idx=0):
 
         orig_shape = hidden_states.shape
         sequence_length = orig_shape[1]
 
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-
+        bsz_tensor = torch.zeros(hidden_states.shape[0], dtype=torch.int32)
         router_logits = self.gate(hidden_states, bsz_tensor)        
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -1457,7 +1477,7 @@ class KQwen3MoeSparseMoeBlockV2(BaseInjectedModule, Qwen3MoeSparseMoeBlock):
             for expert_idx in range(topk_ids.size(1)):
                 expert = self.experts[topk_ids[token_idx, expert_idx]]
                 outs[token_idx] += (
-                    expert.forward(x[token_idx]) * topk_weight[token_idx, expert_idx]
+                    expert.forward(x[token_idx], None, 0) * topk_weight[token_idx, expert_idx]
                 )
         return outs
 
@@ -1479,7 +1499,7 @@ class KQwen3MoeSparseMoeBlockV2(BaseInjectedModule, Qwen3MoeSparseMoeBlock):
                 continue
             expert = self.experts[i + self.ep_rank * self.experts_per_rank]
             tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
-            expert_out = expert.forward(tokens_for_this_expert)
+            expert_out = expert.forward(tokens_for_this_expert, None, 0)
             outputs.append(expert_out)
             start_idx = end_idx
 

@@ -122,7 +122,7 @@ class RotaryEmbeddingV2(BaseInjectedModule, LlamaRotaryEmbedding):
         **kwargs,
     ):
         BaseInjectedModule.__init__(
-            self, key, gguf_loader, config, orig_module, prefill_device, **kwargs
+            self, key, gguf_loader, config, orig_module, **kwargs
         )
         self.orig_module.__init__(
             orig_module.dim,
@@ -224,9 +224,9 @@ class YarnRotaryEmbeddingV3(BaseInjectedModule):
         gguf_loader: GGUFLoader,
         config: PretrainedConfig,
         orig_module: nn.Module,
-        #  device: str = "cpu",
         generate_device: str = "cpu",
         prefill_device: str = "cpu",
+        device: str = "cpu",
         **kwargs,
     ):
         BaseInjectedModule.__init__(

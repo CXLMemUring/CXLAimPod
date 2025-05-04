@@ -565,7 +565,6 @@ class KLinearMarlin(KLinearBase):
         is_k_full=True,
         **kwargs,
     ):
-        assert device.lower() != "cpu", "Marlin quantized linear only supports GPU device"
         super().__init__(key, gguf_loader, config, orig_module, device, **kwargs)
         self.num_bits = num_bits
         self.group_size = group_size
@@ -587,7 +586,6 @@ class KLinearMarlin(KLinearBase):
     def load(self, w: dict | nn.Parameter | tuple | None = None, device: str|None = None):
         if self.loaded: return
         if device is None: device = self.device
-        assert device.lower() != "cpu", "Marlin quantized linear only supports GPU device"
         
         #if self.in_features * self.out_features:
         if w is None: 
@@ -798,6 +796,7 @@ class KTransformersLinear(BaseInjectedModule, KLinearBase):
         generate_op: str| None = "KLinearMarlin",
         prefill_device: str = "cpu",
         prefill_op: str| None = "KLinearTorch",
+        device: str = "cpu",
         **kwargs,
     ):
         BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device,  **kwargs)

@@ -104,8 +104,11 @@ GGML_TYPES = {
     "F32": 0,
     "F16": 1,
     "Q4_0": 2,
+    "Q4_1": 3,
     "Q5_0": 6,
+    "Q5_1": 7,
     "Q8_0": 8,
+    "Q8_1": 9,
     "Q2_K": 10,
     "Q3_K": 11,
     "Q4_K": 12,
@@ -122,8 +125,11 @@ GGML_BLOCK_SIZES = {
     "F16": 2,
     "BF16": 2,
     "Q4_0": 2 + 16,
+    "Q4_1": 2 + 2 + 16,
     "Q5_0": 2 + 4 + 16,
+    "Q5_1": 2 + 2 + 4 + 16,
     "Q8_0": 2 + 32,
+    "Q8_1": 4 + 4 + 32,
     "Q2_K": 256 // 16 + 256 // 4 + 2 + 2,
     "Q3_K": 256 // 8 + 256 // 4 + 12 + 2,
     "Q4_K": 2 + 2 + 12 + 256 // 2,
@@ -138,8 +144,11 @@ GGML_ELEMENTS_PER_BLOCK = {
     "F16": 1,
     "BF16": 1,
     "Q4_0": 32,
+    "Q4_1": 32,
     "Q5_0": 32,
+    "Q5_1": 32,
     "Q8_0": 32,
+    "Q8_1": 32,
     "Q2_K": 256,
     "Q3_K": 256,
     "Q4_K": 256,
@@ -831,6 +840,95 @@ def dequantize_bf16_gpu(data, device, target_dtype = torch.get_default_dtype()):
     res_gpu.copy_(res)
     return res_gpu
 
+def dequantize_i8(data):
+    return np.frombuffer(data, dtype=np.int8)
+
+def dequantize_i8_gpu(data, device, target_dtype = torch.get_default_dtype()):
+    data = np.frombuffer(data, dtype=np.int8)
+    res = torch.from_numpy(data.copy())
+    res_gpu = torch.empty_like(res, device=device, dtype=target_dtype)
+    res_gpu.copy_(res)
+    return res_gpu
+
+def convert_to_i8(tensor):
+    """
+    Convert a tensor to int8 format.
+    
+    Args:
+        tensor: Input tensor of any type
+        
+    Returns:
+        Tensor in int8 format
+    """
+    if isinstance(tensor, np.ndarray):
+        # 优化numpy实现 - 使用更快的vectorized操作
+        tensor = tensor.astype(np.float32)
+        # 使用更高效的方法计算scale
+        abs_max = max(np.abs(tensor.max()), np.abs(tensor.min()))
+        scale = abs_max / 127.0 if abs_max > 0 else 1.0
+        # 一次性计算并转换，避免多次内存分配
+        if scale > 0:
+            tensor_i8 = np.clip(np.round(tensor / scale), -127, 127).astype(np.int8)
+        else:
+            tensor_i8 = np.zeros_like(tensor, dtype=np.int8)
+        return tensor_i8
+    elif isinstance(tensor, torch.Tensor):
+        # 优化PyTorch实现 - 使用更高效的方法
+        tensor = tensor.float()
+        
+        # 对于大型tensor（例如格式14），使用分块处理避免内存问题
+        if tensor.numel() > 10000000:  # 1千万元素以上的大型tensor
+            print(f"Converting large tensor with {tensor.numel()} elements using chunked processing")
+            # 计算绝对最大值，确保scale计算正确
+            with torch.no_grad():
+                abs_max = max(torch.abs(tensor).max().item(), 1e-5)
+                scale = abs_max / 127.0
+                
+                # 分块处理
+                chunk_size = 1000000  # 每块100万元素
+                tensor_i8 = torch.empty_like(tensor, dtype=torch.int8)
+                
+                # 按块处理避免内存溢出
+                for i in range(0, tensor.numel(), chunk_size):
+                    end = min(i + chunk_size, tensor.numel())
+                    chunk = tensor.view(-1)[i:end]
+                    tensor_i8.view(-1)[i:end] = torch.clamp(torch.round(chunk / scale), -127, 127).to(torch.int8)
+                
+                return tensor_i8
+        else:
+            # 小型tensor的标准处理
+            with torch.no_grad():
+                abs_max = max(tensor.abs().max().item(), 1e-5)
+                scale = abs_max / 127.0
+                tensor_i8 = torch.clamp(torch.round(tensor / scale), -127, 127).to(torch.int8)
+                return tensor_i8
+    else:
+        raise TypeError(f"Unsupported tensor type: {type(tensor)}")
+
+# Convert BF16 or other format tensors to I8
+def convert_to_bf16(tensor):
+    """
+    Convert a tensor to bfloat16 format.
+    
+    Args:
+        tensor: Input tensor of any type
+        
+    Returns:
+        Tensor in bfloat16 format
+    """
+    if isinstance(tensor, np.ndarray):
+        # NumPy doesn't have native bfloat16, convert to float32 first
+        # then we'll convert to torch.bfloat16 when needed
+        tensor = tensor.astype(np.float32)
+        return tensor
+    elif isinstance(tensor, torch.Tensor):
+        # Convert torch tensor directly to bfloat16
+        tensor = tensor.float()
+        tensor_bf16 = tensor.to(torch.bfloat16)
+        return tensor_bf16
+    else:
+        raise TypeError(f"Unsupported tensor type: {type(tensor)}")
+
 GGML_DEQUANTIZE = {
     "F32": dequantize_f32,
     "F16": dequantize_f16,
@@ -844,6 +942,7 @@ GGML_DEQUANTIZE = {
     "Q5_K": dequantize_q5_k,
     "Q6_K": dequantize_q6_k,
     "IQ4_XS": dequantize_iq4_xs,
+    "I8": dequantize_i8,
 }
 
 GGML_DEQUANTIZE_GPU = {
@@ -859,6 +958,7 @@ GGML_DEQUANTIZE_GPU = {
     "Q5_K": dequantize_q5_k_gpu,
     "Q6_K": dequantize_q6_k_gpu,
     "IQ4_XS": dequantize_iq4_xs_gpu,
+    "I8": dequantize_i8_gpu,
 }
 
 

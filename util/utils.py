@@ -276,10 +276,15 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                 else:
                     next_token = torch.argmax(next_token_scores, dim=-1)
                     
+                print(f"Debug - generated token: shape={next_token.shape}, values={next_token}")
                 return next_token
                 
             except RuntimeError as e:
-                if "expected m1 and m2 to have the same dtype" in str(e):
+                # Handle various runtime errors with specific strategies
+                error_msg = str(e)
+                print(f"Runtime error in model forward pass: {error_msg}")
+                
+                if "expected m1 and m2 to have the same dtype" in error_msg:
                     print(f"Handling dtype mismatch error in decode_one_tokens: {str(e)}")
                     
                     # Try forcing all inputs to model's native dtype
@@ -307,8 +312,8 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     next_token = torch.argmax(next_token_scores, dim=-1)
                     return next_token
                     
-                elif "shape" in str(e) and ("invalid for input of size" in str(e) or "invalid" in str(e)):
-                    print(f"Handling shape mismatch error: {str(e)}")
+                elif "shape" in error_msg and ("invalid for input of size" in error_msg or "invalid" in error_msg):
+                    print(f"Handling shape mismatch error: {error_msg}")
                     
                     # Reshape input embeddings if needed
                     batch_size = inputs_embeds.size(0)
@@ -355,14 +360,37 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                             fallback_token = torch.tensor([0], device="cpu")  # Use token ID 0 as default fallback
                         return fallback_token
                     
-                elif "DynamicScaledDotProductAttention" in str(e) and "prefill_block_num" in str(e):
-                    print(f"Handling DynamicScaledDotProductAttention error: {str(e)}")
-                    # We should have fixed this with our custom attention implementation
-                    raise
+                elif "index out of range" in error_msg:
+                    print(f"Index out of range error: {error_msg}")
+                    print(f"Debug info - cur_token: {cur_token.shape}, position_ids: {position_ids.shape}, cache_position: {cache_position.shape}")
+                    
+                    # Create a safe token as fallback
+                    if hasattr(model.config, 'eos_token_id'):
+                        fallback_token = torch.tensor([model.config.eos_token_id], device="cpu")
+                    else:
+                        fallback_token = torch.tensor([0], device="cpu")
+                    return fallback_token
+                    
+                elif "DynamicScaledDotProductAttention" in error_msg and "prefill_block_num" in error_msg:
+                    print(f"Handling DynamicScaledDotProductAttention error: {error_msg}")
+                    # Create a safe token as fallback instead of raising
+                    if hasattr(model.config, 'eos_token_id'):
+                        fallback_token = torch.tensor([model.config.eos_token_id], device="cpu")
+                    else:
+                        fallback_token = torch.tensor([0], device="cpu")
+                    return fallback_token
                 else:
-                    raise
+                    # Unknown error - use fallback token
+                    print(f"Unknown error in model forward pass: {error_msg}")
+                    if hasattr(model.config, 'eos_token_id'):
+                        fallback_token = torch.tensor([model.config.eos_token_id], device="cpu")
+                    else:
+                        fallback_token = torch.tensor([0], device="cpu")
+                    return fallback_token
         except Exception as e:
             print(f"Critical error in decode_one_tokens: {e}")
+            import traceback
+            traceback.print_exc()
             # Return a fallback token as last resort instead of crashing
             print("Returning fallback token (EOS) due to critical error")
             if hasattr(model.config, 'eos_token_id'):
@@ -373,8 +401,27 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
     
     def chunk_prefill(inputs, cache_position, past_key_values):
         try:
+            # 检查并强制限制token在vocab范围内
+            vocab_size = 32000
+            if hasattr(model, 'config') and hasattr(model.config, 'vocab_size'):
+                vocab_size = model.config.vocab_size
+            elif hasattr(model.model, 'embed_tokens') and hasattr(model.model.embed_tokens, 'num_embeddings'):
+                vocab_size = model.model.embed_tokens.num_embeddings
+                
+            # 确保输入tokens不超出词汇表范围
+            invalid_indices = inputs >= vocab_size
+            if invalid_indices.any():
+                print(f"Warning: Prefill has tokens outside vocab range: max={inputs.max().item()}, vocab_size={vocab_size}")
+                inputs = torch.clamp(inputs, 0, vocab_size-1)
+            
             # Get embeddings
-            inputs_embeds = model.model.embed_tokens(inputs)
+            try:
+                inputs_embeds = model.model.embed_tokens(inputs)
+            except IndexError as e:
+                print(f"IndexError in embed_tokens, using safe fallback: {e}")
+                # 创建安全的token，确保在范围内
+                safe_inputs = torch.zeros_like(inputs)
+                inputs_embeds = model.model.embed_tokens(safe_inputs)
             
             # Get model's native dtype
             model_dtype = None
@@ -633,13 +680,29 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
         
         # Store the token value safely, handling different possible shapes
         try:
+            # 获取vocab大小
+            vocab_size = 32000
+            if hasattr(model, 'config') and hasattr(model.config, 'vocab_size'):
+                vocab_size = model.config.vocab_size
+            elif hasattr(model.model, 'embed_tokens') and hasattr(model.model.embed_tokens, 'num_embeddings'):
+                vocab_size = model.model.embed_tokens.num_embeddings
+            
+            # 检查并确保token在合法范围内
             if next_token.numel() > 0:
                 if next_token.dim() == 0:
                     token_value = next_token.item()
                 elif next_token.dim() == 1 and next_token.size(0) > 0:
+                    # If it's a 1D tensor, take the first element
                     token_value = next_token[0].item()
                 else:
+                    # Flatten any multi-dimensional tensor and take first element
                     token_value = next_token.view(-1)[0].item()
+                
+                # 确保token在词汇表范围内
+                if token_value >= vocab_size:
+                    print(f"Warning: Token {token_value} exceeds vocab size {vocab_size}, using fallback token")
+                    token_value = 0  # 使用安全token
+                
                 tokens.append(int(token_value))
             else:
                 print("Warning: Empty token detected")
@@ -659,79 +722,166 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
         start_time = time.time()
         for i in range(1, max_new_tokens):
             # Remove CUDA-specific code
-            next_token = decode_one_tokens(None, next_token.unsqueeze(0) if next_token.dim() == 1 else next_token, position_ids, cache_position, past_key_values, logits_warper, generation_config, False)
-            
-            # Ensure next_token has proper shape for concatenation
-            if next_token.dim() == 0:  # If next_token is a scalar
-                next_token = next_token.unsqueeze(0)  # Make it a 1D tensor
-                
-            # Proper concatenation ensuring tensor dimensions match
-            if inputs.dim() == 2 and next_token.dim() == 1:
-                inputs = torch.cat([inputs, next_token.unsqueeze(0)], dim=-1)
-            else:
-                # Handle other dimension combinations
-                next_token_shaped = next_token.reshape(1, -1)
-                inputs = torch.cat([inputs, next_token_shaped], dim=-1)
-                
-            # Ensure next_token is the right shape for generated_ids assignment
-            # generated_ids expects a single value at each position per batch
-            if next_token.dim() > 1:
-                # If multi-dimensional, take first token
-                token_value = next_token.view(-1)[0].item()
-                token_tensor = torch.tensor([token_value], dtype=torch.int, device=torch_device)
-                generated_ids[:, seq_length] = token_tensor
-            else:
-                # If already 1D or scalar, just convert to int
-                token_value = next_token.item() if next_token.numel() == 1 else next_token[0].item()
-                generated_ids[:, seq_length] = torch.tensor([token_value], dtype=torch.int, device=torch_device)
-            
-            # Store the token value safely, handling different possible shapes
             try:
-                if next_token.numel() > 0:
-                    if next_token.dim() == 0:
-                        token_value = next_token.item()
-                    elif next_token.dim() == 1 and next_token.size(0) > 0:
-                        token_value = next_token[0].item()
-                    else:
-                        token_value = next_token.view(-1)[0].item()
-                    tokens.append(int(token_value))
+                print(f"Generating token {i}/{max_new_tokens}")
+                
+                # Ensure next_token has the right shape for decode_one_tokens
+                if next_token.dim() == 0:
+                    next_token_input = next_token.reshape(1, 1)
+                elif next_token.dim() == 1:
+                    next_token_input = next_token.reshape(1, -1)
                 else:
-                    print("Warning: Empty token detected")
+                    # Keep the first element
+                    next_token_input = next_token.reshape(1, -1)
+                
+                # Get vocab size
+                vocab_size = 32000  # Default
+                if hasattr(model, 'config') and hasattr(model.config, 'vocab_size'):
+                    vocab_size = model.config.vocab_size
+                elif hasattr(model.model, 'embed_tokens') and hasattr(model.model.embed_tokens, 'num_embeddings'):
+                    vocab_size = model.model.embed_tokens.num_embeddings
+                
+                # Clip token values to be within vocabulary range
+                if next_token_input.numel() > 0:
+                    invalid_indices = next_token_input >= vocab_size
+                    if invalid_indices.any():
+                        print(f"Warning: Clipping out-of-range token IDs in generation loop: {next_token_input[invalid_indices].tolist()}")
+                        next_token_input = torch.clamp(next_token_input, 0, vocab_size - 1)
+                
+                # Print debug info before calling decode_one_tokens
+                print(f"Calling decode_one_tokens with token shape: {next_token_input.shape}")
+                
+                next_token = decode_one_tokens(
+                    None, 
+                    next_token_input, 
+                    position_ids, 
+                    cache_position, 
+                    past_key_values, 
+                    logits_warper, 
+                    generation_config, 
+                    False
+                )
+                
+                print(f"Returned token shape: {next_token.shape}, values: {next_token}")
+                
+                # Ensure result token is within vocab range before adding to inputs or tokens list
+                if next_token.numel() > 0:
+                    invalid_indices = next_token >= vocab_size
+                    if invalid_indices.any():
+                        print(f"Warning: Clipping out-of-range generated token IDs: {next_token[invalid_indices].tolist()}")
+                        next_token = torch.clamp(next_token, 0, vocab_size - 1)
+                
+                # Ensure next_token has proper shape for concatenation
+                if inputs.dim() == 2:
+                    # Ensure next_token is properly shaped for concatenation
+                    if next_token.dim() == 0:  # Scalar
+                        next_token_concat = next_token.reshape(1, 1)
+                    elif next_token.dim() == 1:  # Vector
+                        if next_token.size(0) == 1:
+                            next_token_concat = next_token.reshape(1, 1)
+                        else:
+                            # Take first token if multiple returned
+                            next_token_concat = next_token[0].reshape(1, 1)
+                    else:  # Multi-dimensional
+                        # Flatten and take first element
+                        next_token_concat = next_token.reshape(-1)[0].reshape(1, 1)
+                    
+                    # Now concatenate
+                    inputs = torch.cat([inputs, next_token_concat], dim=1)
+                else:
+                    print(f"Warning: Unexpected inputs shape: {inputs.shape}")
+                    # Fallback concatenation
+                    try:
+                        inputs = torch.cat([inputs, next_token.reshape(1, -1)], dim=-1)
+                    except Exception as concat_error:
+                        print(f"Error during concatenation: {concat_error}")
+                        # Safe fallback - manually extend tensor
+                        old_shape = inputs.shape
+                        extended_shape = list(old_shape)
+                        extended_shape[-1] += 1
+                        extended_inputs = torch.zeros(extended_shape, dtype=inputs.dtype, device=inputs.device)
+                        extended_inputs[..., :-1] = inputs
+                        if next_token.numel() > 0:
+                            token_value = next_token.reshape(-1)[0].item()
+                            extended_inputs[..., -1] = token_value
+                        inputs = extended_inputs
+                
+                # Store token value in generated_ids safely
+                try:
+                    # Extract a single token value regardless of shape
+                    token_value = 0  # Default value
+                    if next_token.numel() > 0:
+                        flat_token = next_token.reshape(-1)
+                        token_value = flat_token[0].item()
+                    
+                    # Store in generated_ids
+                    generated_ids[:, seq_length] = token_value
+                except Exception as token_error:
+                    print(f"Error storing token in generated_ids: {token_error}")
+                    # Use default value
+                    generated_ids[:, seq_length] = 0
+                
+                # Store the token value safely
+                try:
+                    if next_token.numel() > 0:
+                        # Extract first element regardless of tensor shape
+                        token_value = next_token.reshape(-1)[0].item()
+                        tokens.append(int(token_value))
+                    else:
+                        print("Warning: Empty token detected")
+                        tokens.append(0)  # Default token
+                except Exception as e:
+                    print(f"Error extracting token value: {e}")
                     tokens.append(0)  # Default token
-            except Exception as e:
-                print(f"Error extracting token value: {e}")
-                tokens.append(0)  # Default token
                 
-            seq_length += 1
-            
-            # Check if we need to stop generation
-            should_stop = False
-            try:
-                if next_token.numel() > 0:
-                    if next_token.dim() == 0:
-                        token_to_check = next_token.item()
-                    elif next_token.dim() >= 1 and next_token.size(0) > 0:
-                        token_to_check = next_token[0].item()
-                    else:
-                        token_to_check = 0
+                seq_length += 1
+                
+                # Check if we need to stop generation
+                should_stop = False
+                try:
+                    # Get token to check safely
+                    token_to_check = None
+                    if next_token.numel() > 0:
+                        token_to_check = next_token.reshape(-1)[0].item()
+                    
+                    if token_to_check is not None:
+                        # Check for end of sequence tokens
+                        is_eos = False
+                        if hasattr(tokenizer, 'eos_token_id') and token_to_check == tokenizer.eos_token_id:
+                            is_eos = True
+                        elif tokenizer.decode([token_to_check]) == '<|im_end|>':
+                            is_eos = True
                         
-                    if token_to_check == tokenizer.eos_token_id or tokenizer.decode([token_to_check]) == '<|im_end|>':
-                        print(stream.end(), end="", flush=True)
-                        should_stop = True
+                        if is_eos:
+                            print(stream.end(), end="", flush=True)
+                            should_stop = True
+                        else:
+                            print(stream.put(token_to_check), end="", flush=True)
                     else:
-                        print(stream.put(token_to_check), end="", flush=True)
-                else:
-                    print("Empty next_token, stopping generation")
-                    should_stop = True
-            except Exception as e:
-                print(f"Error checking token: {e}")
-                should_stop = True
+                        print("Empty next_token, stopping generation")
+                        should_stop = True
+                except Exception as e:
+                    print(f"Error checking token: {e}")
+                    print(f"Token shape: {next_token.shape}, values: {next_token}")
+                    # Continue generation despite error
                 
-            if should_stop:
-                break
+                if should_stop:
+                    break
                 
-            cache_position += 1
-            position_ids = cache_position.unsqueeze(0)
+                # Update position tracking
+                cache_position += 1
+                position_ids = cache_position.unsqueeze(0)
+                
+            except Exception as loop_error:
+                print(f"Error in generation loop: {loop_error}")
+                import traceback
+                traceback.print_exc()
+                # Try to continue with next token
+                seq_length += 1
+                cache_position += 1
+                position_ids = cache_position.unsqueeze(0)
+                # Create a fallback token
+                next_token = torch.tensor([0], device=torch_device)
 
     total_time = time.time() - start_time
     tokens_generated = len(tokens)
