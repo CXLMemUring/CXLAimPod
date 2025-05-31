@@ -172,6 +172,31 @@ class KExpertsCPU(KExpertsBase):
                 print(f"Converting down tensor from {self.down_type} to int8")
                 self.down = convert_to_i8(self.down)
                 self.down_type = GGMLQuantizationType.I8
+        elif self.backend == "AMXDynamicInt8":
+            from cpuinfer_ext.moe import AMX_MOEConfig, AMXInt8_MOE
+            # Don't convert tensors to I8 format here, keep original format
+            # Store original types for later conversion
+            self.original_gate_type = self.gate_type
+            self.original_up_type = self.up_type
+            self.original_down_type = self.down_type
+            
+            # Initialize with original tensors
+            moe_config = AMX_MOEConfig(
+                n_routed_experts,
+                self.config.num_experts_per_tok,
+                self.config.hidden_size,
+                self.config.moe_intermediate_size,
+                25600,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+            )
+            self.moe = AMXInt8_MOE(moe_config)
+            
+            # Flag to indicate we need to convert during forward
+            self.needs_dynamic_conversion = True
+            self.cpu_infer.submit(self.moe.load_weights())
+            self.cpu_infer.sync()
         
         gate_ptr = ctypes.addressof(
             ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
@@ -292,6 +317,51 @@ class KExpertsCPU(KExpertsBase):
             return KExpertsCPU.output_gpu_map[self.out_device]
 
     def forward(self, input_tensor, expert_ids, weights, bsz_tensor=None, cuda_graph_idx=0):
+        # For AMXDynamicInt8 backend, convert tensors before forwarding
+        if self.backend == "AMXDynamicInt8" and hasattr(self, 'needs_dynamic_conversion') and self.needs_dynamic_conversion:
+            from ktransformers.util.custom_gguf import GGMLQuantizationType, convert_to_i8
+            print("Performing dynamic conversion from original format to int8")
+            
+            # Convert tensors to I8 format dynamically
+            if self.original_gate_type != GGMLQuantizationType.I8:
+                self.gate = convert_to_i8(self.gate)
+            
+            if self.original_up_type != GGMLQuantizationType.I8:
+                self.up = convert_to_i8(self.up)
+            
+            if self.original_down_type != GGMLQuantizationType.I8:
+                self.down = convert_to_i8(self.down)
+                
+            # Update pointers for the MOE module
+            gate_ptr = ctypes.addressof(
+                ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+            )
+            up_ptr = ctypes.addressof(
+                ctypes.cast(self.up.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+            )
+            down_ptr = ctypes.addressof(
+                ctypes.cast(self.down.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+            )
+            
+            # Reload MOE with converted tensors
+            from cpuinfer_ext.moe import AMX_MOEConfig, AMXInt8_MOE
+            moe_config = AMX_MOEConfig(
+                self.n_routed_experts,
+                self.config.num_experts_per_tok,
+                self.config.hidden_size,
+                self.config.moe_intermediate_size,
+                25600,
+                gate_ptr,
+                up_ptr,
+                down_ptr,
+            )
+            self.moe = AMXInt8_MOE(moe_config)
+            self.cpu_infer.submit(self.moe.load_weights())
+            self.cpu_infer.sync()
+            
+            # Set flag to avoid reconversion
+            self.needs_dynamic_conversion = False
+        
         # generate, capture and run cuda graph
         # print(expert_ids)
         if bsz_tensor is None:
