@@ -8,8 +8,8 @@ LIBBPF_DIR = /usr/include
 VMLINUX_H = vmlinux.h
 
 # BPF program
-BPF_PROG = cxl_pmu.bpc.c
-BPF_OBJ = cxl_pmu.bpc.o
+BPF_PROG = cxl_pmu.bpf.c
+BPF_OBJ = cxl_pmu.bpf.o
 
 # Userspace program
 USER_PROG = cxl_sched.c
