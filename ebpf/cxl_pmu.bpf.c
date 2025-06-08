@@ -14,7 +14,6 @@
  */
 
 #include <scx/common.bpf.h>
-#include <linux/types.h>
 
 char _license[] SEC("license") = "GPL";
 
@@ -101,9 +100,13 @@ struct {
 /* Global scheduler state */
 static u64 global_vtime = 0;
 const volatile u32 nr_cpus = 1;
-UEI_DEFINE(uei);
 
 /* Helper functions */
+
+static inline bool vtime_before(u64 a, u64 b)
+{
+	return (s64)(a - b) < 0;
+}
 
 static inline bool is_moe_vectordb_task(struct task_struct *p)
 {
@@ -260,6 +263,7 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 	u32 pid = p->pid;
 	s32 best_cpu = prev_cpu;
 	u32 best_score = 0;
+	int cpu;
 	
 	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (!tctx)
@@ -392,7 +396,7 @@ void BPF_STRUCT_OPS(cxl_dispatch, s32 cpu, struct task_struct *prev)
 		return;
 		
 	// Update counters for newly scheduled task
-	struct task_struct *next = bpf_get_current_task();
+	struct task_struct *next = (struct task_struct *)(void *)bpf_get_current_task_btf();
 	if (next && cpu_ctx) {
 		struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor, next, 0, 0);
 		if (tctx) {
@@ -445,6 +449,7 @@ void BPF_STRUCT_OPS(cxl_exit_task, struct task_struct *p)
 s32 BPF_STRUCT_OPS_SLEEPABLE(cxl_init)
 {
 	s32 ret;
+	int cpu;
 	
 	ret = scx_bpf_create_dsq(FALLBACK_DSQ_ID, NUMA_NO_NODE);
 	if (ret)
@@ -462,7 +467,7 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(cxl_init)
 
 void BPF_STRUCT_OPS(cxl_exit, struct scx_exit_info *ei)
 {
-	UEI_RECORD(uei, ei);
+	// Exit handler - cleanup if needed
 }
 
 SCX_OPS_DEFINE(cxl_ops,
