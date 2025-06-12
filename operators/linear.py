@@ -40,6 +40,20 @@ from ktransformers.server.config.config import Config
 from typing import Dict, Tuple, Optional, Union
 import numpy as np
 
+def _safe_pin_memory():
+    """Check if pinned memory can be used safely"""
+    try:
+        if torch.cuda.is_available():
+            # Try to allocate a small tensor with pinned memory to test if it works
+            test_tensor = torch.zeros(1, device="cpu", pin_memory=True)
+            del test_tensor
+            return True
+    except:
+        pass
+    return False
+
+_use_pin_memory = _safe_pin_memory()
+
 #class KLinearBase(BaseInjectedModule, ABC):
 class KLinearBase(ABC):
     def __init__(
@@ -753,8 +767,8 @@ class KLinearCPUInfer(KLinearBase):
         if warmup:
             KLinearCPUInfer.CPU_INFER.submit(self.linear.warm_up())
             KLinearCPUInfer.CPU_INFER.sync()
-        self.input_tensor_cpu = torch.zeros((1, 1, self.in_features), device="cpu", pin_memory=True)
-        self.output_cpu = torch.zeros((1, 1, self.out_features), device="cpu", pin_memory=True, dtype=torch.bfloat16)
+        self.input_tensor_cpu = torch.zeros((1, 1, self.in_features), device="cpu", pin_memory=_use_pin_memory)
+        self.output_cpu = torch.zeros((1, 1, self.out_features), device="cpu", pin_memory=_use_pin_memory, dtype=torch.bfloat16)
         self.output_gpu = torch.zeros((1, 1, self.out_features), device=self.out_device)
 
     def load_weights(self, w: dict | nn.Parameter | tuple | None = None, device: str = "cpu"):

@@ -39,8 +39,22 @@ from ktransformers.operators.cpuinfer import CPUInfer
 
 def deduplicate_and_sort(lst):
     return sorted(set(lst))
+
+def _safe_pin_memory():
+    """Check if pinned memory can be used safely"""
+    try:
+        if torch.cuda.is_available():
+            # Try to allocate a small tensor with pinned memory to test if it works
+            test_tensor = torch.zeros(1, device="cpu", pin_memory=True)
+            del test_tensor
+            return True
+    except:
+        pass
+    return False
+
 #cuda_graphs = [Config().chunk_size] 
 cuda_graphs = deduplicate_and_sort([1, 2, 3, Config().max_batch_size, 64, Config().chunk_size])
+_use_pin_memory = _safe_pin_memory()
 # class Base(BaseInjectedModule, ABC):
 class KExpertsBase(ABC):
     def __init__(self, key: str, gguf_loader: GGUFLoader, config: PretrainedConfig, orig_module: nn.Module, device: str = "cuda", **kwargs):
@@ -154,6 +168,19 @@ class KExpertsCPU(KExpertsBase):
         self.up_type = w["up_type"]
         self.down_type = w["down_type"]
         
+        
+        gate_ptr = ctypes.addressof(
+            ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+        )
+        up_ptr = ctypes.addressof(
+            ctypes.cast(self.up.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+        )
+        down_ptr = ctypes.addressof(
+            ctypes.cast(self.down.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
+        )
+        # print(self.gate_qtype, self.up_qtype, self.down_qtype)
+        n_routed_experts = self.n_routed_experts
+        
         # Convert tensors to I8 if using AMXInt8 backend
         if self.backend == "AMXInt8":
             from ktransformers.util.custom_gguf import GGMLQuantizationType, convert_to_i8
@@ -197,18 +224,6 @@ class KExpertsCPU(KExpertsBase):
             self.needs_dynamic_conversion = True
             self.cpu_infer.submit(self.moe.load_weights())
             self.cpu_infer.sync()
-        
-        gate_ptr = ctypes.addressof(
-            ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-        )
-        up_ptr = ctypes.addressof(
-            ctypes.cast(self.up.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-        )
-        down_ptr = ctypes.addressof(
-            ctypes.cast(self.down.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-        )
-        # print(self.gate_qtype, self.up_qtype, self.down_qtype)
-        n_routed_experts = self.n_routed_experts
         self.cpu_infer = KExpertsCPU.CPU_INFER
         # n_routed_experts = len(self.orig_module)
         if self.backend == "llamafile":
@@ -277,17 +292,17 @@ class KExpertsCPU(KExpertsBase):
                 KExpertsCPU.output_gpu_map[self.out_device] = torch.zeros((cuda_graphs, self.config.hidden_size), device=self.out_device)
         if KExpertsCPU.input_tensor_cpu == None:
             if isinstance(cuda_graphs, list):
-                KExpertsCPU.input_tensor_cpu = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device="cpu", pin_memory=True) for i in range(len(cuda_graphs))]
-                KExpertsCPU.expert_ids_cpu = [torch.zeros((cuda_graphs[i], num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=True) for i in range(len(cuda_graphs))]
-                KExpertsCPU.weights_cpu = [torch.zeros((cuda_graphs[i], num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=True) for i in range(len(cuda_graphs))]
-                KExpertsCPU.output_cpu = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device="cpu", pin_memory=True, dtype=torch.bfloat16) for i in range(len(cuda_graphs))]
-                KExpertsCPU.bsz_tensor_cpu = [torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=True) for i in range(len(cuda_graphs))]
+                KExpertsCPU.input_tensor_cpu = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device="cpu", pin_memory=_use_pin_memory) for i in range(len(cuda_graphs))]
+                KExpertsCPU.expert_ids_cpu = [torch.zeros((cuda_graphs[i], num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=_use_pin_memory) for i in range(len(cuda_graphs))]
+                KExpertsCPU.weights_cpu = [torch.zeros((cuda_graphs[i], num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=_use_pin_memory) for i in range(len(cuda_graphs))]
+                KExpertsCPU.output_cpu = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device="cpu", pin_memory=_use_pin_memory, dtype=torch.bfloat16) for i in range(len(cuda_graphs))]
+                KExpertsCPU.bsz_tensor_cpu = [torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=_use_pin_memory) for i in range(len(cuda_graphs))]
             else:
-                KExpertsCPU.input_tensor_cpu = torch.zeros((cuda_graphs, self.config.hidden_size), device="cpu", pin_memory=True)
-                KExpertsCPU.expert_ids_cpu = torch.zeros((cuda_graphs, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=True)
-                KExpertsCPU.weights_cpu = torch.zeros((cuda_graphs, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=True)
-                KExpertsCPU.output_cpu = torch.zeros((cuda_graphs, self.config.hidden_size), device="cpu", pin_memory=True, dtype=torch.bfloat16)
-                KExpertsCPU.bsz_tensor_cpu = torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=True)
+                KExpertsCPU.input_tensor_cpu = torch.zeros((cuda_graphs, self.config.hidden_size), device="cpu", pin_memory=_use_pin_memory)
+                KExpertsCPU.expert_ids_cpu = torch.zeros((cuda_graphs, num_experts_per_tok), device="cpu", dtype=torch.long, pin_memory=_use_pin_memory)
+                KExpertsCPU.weights_cpu = torch.zeros((cuda_graphs, num_experts_per_tok), device="cpu", dtype=torch.float32, pin_memory=_use_pin_memory)
+                KExpertsCPU.output_cpu = torch.zeros((cuda_graphs, self.config.hidden_size), device="cpu", pin_memory=_use_pin_memory, dtype=torch.bfloat16)
+                KExpertsCPU.bsz_tensor_cpu = torch.zeros((1), device="cpu", dtype=torch.int32, pin_memory=_use_pin_memory)
             
     def submit_for_one_decode(self, input_tensor, expert_ids, weights, bsz_tensor=None, cuda_graph_idx=0):
         if bsz_tensor is None:

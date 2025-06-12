@@ -12,7 +12,6 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
-#include <mutex>
 #include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
@@ -21,72 +20,13 @@
 // Default parameters
 constexpr size_t DEFAULT_BUFFER_SIZE = 1 * 1024 * 1024 * 1024UL; // 1GB
 constexpr size_t DEFAULT_BLOCK_SIZE = 4096;                      // 4KB
-constexpr int DEFAULT_DURATION = 60;                             // seconds
-constexpr int DEFAULT_NUM_THREADS = 2;      // total threads
-constexpr float DEFAULT_READ_RATIO = 0.5;   // 50% readers, 50% writers
-constexpr size_t DEFAULT_MAX_BANDWIDTH = 0; // 0 means unlimited (MB/s)
+constexpr int DEFAULT_DURATION = 10;                             // seconds
+constexpr int DEFAULT_NUM_THREADS = 20;   // total threads
+constexpr float DEFAULT_READ_RATIO = 0.5; // 50% readers, 50% writers
 
 struct ThreadStats {
   size_t bytes_processed = 0;
   size_t operations = 0;
-};
-
-// Rate limiter using token bucket algorithm
-class RateLimiter {
-private:
-  std::mutex mutex_;
-  size_t tokens_;
-  size_t max_tokens_;
-  size_t tokens_per_second_;
-  std::chrono::steady_clock::time_point last_refill_;
-
-public:
-  RateLimiter(size_t max_bandwidth_mbps)
-      : tokens_(0), max_tokens_(0), tokens_per_second_(0) {
-    if (max_bandwidth_mbps > 0) {
-      max_tokens_ = max_bandwidth_mbps * 1024 * 1024; // Convert MB/s to bytes/s
-      tokens_per_second_ = max_tokens_;
-      tokens_ = max_tokens_;
-    }
-    last_refill_ = std::chrono::steady_clock::now();
-  }
-
-  bool acquire(size_t bytes) {
-    if (tokens_per_second_ == 0) {
-      return true; // Unlimited
-    }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // Refill tokens based on elapsed time
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
-        now - last_refill_);
-
-    if (elapsed.count() > 0) {
-      size_t new_tokens = (tokens_per_second_ * elapsed.count()) / 1000000;
-      tokens_ = std::min(tokens_ + new_tokens, max_tokens_);
-      last_refill_ = now;
-    }
-
-    // Check if we have enough tokens
-    if (tokens_ >= bytes) {
-      tokens_ -= bytes;
-      return true;
-    }
-
-    return false;
-  }
-
-  void wait_for_tokens(size_t bytes) {
-    if (tokens_per_second_ == 0) {
-      return; // Unlimited
-    }
-
-    while (!acquire(bytes)) {
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-  }
 };
 
 struct BenchmarkConfig {
@@ -95,7 +35,6 @@ struct BenchmarkConfig {
   int duration = DEFAULT_DURATION;
   int num_threads = DEFAULT_NUM_THREADS;
   float read_ratio = DEFAULT_READ_RATIO;
-  size_t max_bandwidth_mbps = DEFAULT_MAX_BANDWIDTH;
   std::string device_path;
   bool use_mmap = false;
   bool is_cxl_mem = false;
@@ -113,8 +52,6 @@ void print_usage(const char *prog_name) {
       << "  -d, --duration=SECONDS    Test duration in seconds (default: 10)\n"
       << "  -r, --read-ratio=RATIO    Ratio of readers (0.0-1.0, default: "
          "0.5)\n"
-      << "  -B, --max-bandwidth=MB/s  Maximum total bandwidth in MB/s "
-         "(0=unlimited, default: 0)\n"
       << "  -D, --device=PATH         CXL device path (if not specified, "
          "memory is used)\n"
       << "  -m, --mmap                Use mmap instead of read/write syscalls\n"
@@ -131,7 +68,6 @@ BenchmarkConfig parse_args(int argc, char *argv[]) {
       {"threads", required_argument, 0, 't'},
       {"duration", required_argument, 0, 'd'},
       {"read-ratio", required_argument, 0, 'r'},
-      {"max-bandwidth", required_argument, 0, 'B'},
       {"device", required_argument, 0, 'D'},
       {"mmap", no_argument, 0, 'm'},
       {"cxl-mem", no_argument, 0, 'c'},
@@ -139,7 +75,7 @@ BenchmarkConfig parse_args(int argc, char *argv[]) {
       {0, 0, 0, 0}};
 
   int opt, option_index = 0;
-  while ((opt = getopt_long(argc, argv, "b:s:t:d:r:B:D:mch", long_options,
+  while ((opt = getopt_long(argc, argv, "b:s:t:d:r:D:mch", long_options,
                             &option_index)) != -1) {
     switch (opt) {
     case 'b':
@@ -160,9 +96,6 @@ BenchmarkConfig parse_args(int argc, char *argv[]) {
         std::cerr << "Read ratio must be between 0.0 and 1.0\n";
         exit(1);
       }
-      break;
-    case 'B':
-      config.max_bandwidth_mbps = std::stoull(optarg);
       break;
     case 'D':
       config.device_path = optarg;
@@ -186,17 +119,11 @@ BenchmarkConfig parse_args(int argc, char *argv[]) {
 }
 
 void reader_thread(void *buffer, size_t buffer_size, size_t block_size,
-                   std::atomic<bool> &stop_flag, ThreadStats &stats,
-                   RateLimiter *rate_limiter) {
+                   std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Read block from the buffer
     std::memcpy(local_buffer.data(), static_cast<char *>(buffer) + offset,
                 block_size);
@@ -211,17 +138,11 @@ void reader_thread(void *buffer, size_t buffer_size, size_t block_size,
 }
 
 void writer_thread(void *buffer, size_t buffer_size, size_t block_size,
-                   std::atomic<bool> &stop_flag, ThreadStats &stats,
-                   RateLimiter *rate_limiter) {
+                   std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Write block to the buffer
     std::memcpy(static_cast<char *>(buffer) + offset, local_buffer.data(),
                 block_size);
@@ -236,17 +157,11 @@ void writer_thread(void *buffer, size_t buffer_size, size_t block_size,
 }
 
 void device_reader_thread(int fd, size_t file_size, size_t block_size,
-                          std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          RateLimiter *rate_limiter) {
+                          std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Seek to the position
     lseek(fd, offset, SEEK_SET);
 
@@ -268,17 +183,11 @@ void device_reader_thread(int fd, size_t file_size, size_t block_size,
 }
 
 void device_writer_thread(int fd, size_t file_size, size_t block_size,
-                          std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          RateLimiter *rate_limiter) {
+                          std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Seek to the position
     lseek(fd, offset, SEEK_SET);
 
@@ -299,17 +208,11 @@ void device_writer_thread(int fd, size_t file_size, size_t block_size,
 }
 
 void mmap_reader_thread(void *mapped_area, size_t file_size, size_t block_size,
-                        std::atomic<bool> &stop_flag, ThreadStats &stats,
-                        RateLimiter *rate_limiter) {
+                        std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Read block from the mapped area
     std::memcpy(local_buffer.data(), static_cast<char *>(mapped_area) + offset,
                 block_size);
@@ -324,17 +227,11 @@ void mmap_reader_thread(void *mapped_area, size_t file_size, size_t block_size,
 }
 
 void mmap_writer_thread(void *mapped_area, size_t file_size, size_t block_size,
-                        std::atomic<bool> &stop_flag, ThreadStats &stats,
-                        RateLimiter *rate_limiter) {
+                        std::atomic<bool> &stop_flag, ThreadStats &stats) {
   std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
   size_t offset = 0;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
-    // Wait for rate limiter tokens
-    if (rate_limiter) {
-      rate_limiter->wait_for_tokens(block_size);
-    }
-
     // Write block to the mapped area
     std::memcpy(static_cast<char *>(mapped_area) + offset, local_buffer.data(),
                 block_size);
@@ -355,23 +252,6 @@ int main(int argc, char *argv[]) {
   int num_readers = static_cast<int>(config.num_threads * config.read_ratio);
   int num_writers = config.num_threads - num_readers;
 
-  // Create rate limiters for read and write based on ratio
-  std::unique_ptr<RateLimiter> read_limiter = nullptr;
-  std::unique_ptr<RateLimiter> write_limiter = nullptr;
-
-  if (config.max_bandwidth_mbps > 0) {
-    size_t read_bandwidth =
-        static_cast<size_t>(config.max_bandwidth_mbps * config.read_ratio);
-    size_t write_bandwidth = config.max_bandwidth_mbps - read_bandwidth;
-
-    if (num_readers > 0) {
-      read_limiter = std::make_unique<RateLimiter>(read_bandwidth);
-    }
-    if (num_writers > 0) {
-      write_limiter = std::make_unique<RateLimiter>(write_bandwidth);
-    }
-  }
-
   std::cout << "=== CXL Double Bandwidth Microbenchmark ===" << std::endl;
   std::cout << "Buffer size: " << config.buffer_size << " bytes" << std::endl;
   std::cout << "Block size: " << config.block_size << " bytes" << std::endl;
@@ -379,18 +259,6 @@ int main(int argc, char *argv[]) {
   std::cout << "Total threads: " << config.num_threads << std::endl;
   std::cout << "Read ratio: " << config.read_ratio << " (" << num_readers
             << " readers, " << num_writers << " writers)" << std::endl;
-
-  if (config.max_bandwidth_mbps > 0) {
-    size_t read_bandwidth =
-        static_cast<size_t>(config.max_bandwidth_mbps * config.read_ratio);
-    size_t write_bandwidth = config.max_bandwidth_mbps - read_bandwidth;
-    std::cout << "Bandwidth limit: " << config.max_bandwidth_mbps
-              << " MB/s total "
-              << "(" << read_bandwidth << " MB/s read, " << write_bandwidth
-              << " MB/s write)" << std::endl;
-  } else {
-    std::cout << "Bandwidth limit: Unlimited" << std::endl;
-  }
 
   if (!config.device_path.empty()) {
     std::cout << "Device: " << config.device_path << std::endl;
@@ -431,14 +299,13 @@ int main(int argc, char *argv[]) {
       for (int i = 0; i < num_readers; i++) {
         threads.emplace_back(reader_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
-                             std::ref(thread_stats[i]), read_limiter.get());
+                             std::ref(thread_stats[i]));
       }
 
       for (int i = 0; i < num_writers; i++) {
         threads.emplace_back(writer_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
-                             std::ref(thread_stats[num_readers + i]),
-                             write_limiter.get());
+                             std::ref(thread_stats[num_readers + i]));
       }
     } else {
       // Open the device
@@ -464,29 +331,27 @@ int main(int argc, char *argv[]) {
         for (int i = 0; i < num_readers; i++) {
           threads.emplace_back(mmap_reader_thread, mapped_area,
                                config.buffer_size, config.block_size,
-                               std::ref(stop_flag), std::ref(thread_stats[i]),
-                               read_limiter.get());
+                               std::ref(stop_flag), std::ref(thread_stats[i]));
         }
 
         for (int i = 0; i < num_writers; i++) {
-          threads.emplace_back(
-              mmap_writer_thread, mapped_area, config.buffer_size,
-              config.block_size, std::ref(stop_flag),
-              std::ref(thread_stats[num_readers + i]), write_limiter.get());
+          threads.emplace_back(mmap_writer_thread, mapped_area,
+                               config.buffer_size, config.block_size,
+                               std::ref(stop_flag),
+                               std::ref(thread_stats[num_readers + i]));
         }
       } else {
         // Use read/write for device access
         for (int i = 0; i < num_readers; i++) {
           threads.emplace_back(device_reader_thread, fd, config.buffer_size,
                                config.block_size, std::ref(stop_flag),
-                               std::ref(thread_stats[i]), read_limiter.get());
+                               std::ref(thread_stats[i]));
         }
 
         for (int i = 0; i < num_writers; i++) {
           threads.emplace_back(device_writer_thread, fd, config.buffer_size,
                                config.block_size, std::ref(stop_flag),
-                               std::ref(thread_stats[num_readers + i]),
-                               write_limiter.get());
+                               std::ref(thread_stats[num_readers + i]));
         }
       }
     }

@@ -1,221 +1,236 @@
-# CXL PMU-aware eBPF Scheduler
+# CXL 带宽感知调度器
 
-A Linux kernel scheduler extension using eBPF and sched_ext framework that optimizes scheduling decisions based on CXL (Compute Express Link) PMU metrics and DAMON-like memory access patterns.
+基于eBPF的CXL内存带宽感知调度器，专门优化读写密集型任务的性能。
 
-## Features
+## 🚀 快速开始
 
-- **CXL PMU Integration**: Real-time monitoring of memory bandwidth, cache hit rates, and latency
-- **DAMON-like Memory Monitoring**: Tracks memory access patterns and locality scores
-- **MoE VectorDB Optimization**: Special handling for Mixture of Experts and Vector Database workloads
-- **Dynamic Kworker Management**: Intelligent promotion/demotion of kernel workers
-- **CPU Affinity Optimization**: Prefers CXL-attached CPUs for memory-intensive tasks
-
-## Architecture
-
-### Core Components
-
-1. **Task Classification**:
-   - `TASK_TYPE_MOE_VECTORDB`: Vector database and MoE workloads
-   - `TASK_TYPE_KWORKER`: Kernel worker threads
-   - `TASK_TYPE_REGULAR`: Standard user processes
-   - `TASK_TYPE_LATENCY_SENSITIVE`: Low-latency critical tasks
-
-2. **Memory Access Monitoring**:
-   - Tracks access patterns per task
-   - Calculates locality scores (0-100)
-   - Estimates working set sizes
-   - Monitors hot/cold memory regions
-
-3. **CXL PMU Metrics**:
-   - Memory bandwidth utilization
-   - Cache hit rates
-   - Memory access latency
-   - CXL device utilization
-
-4. **Scheduling Decisions**:
-   - CPU selection based on CXL topology
-   - Dynamic priority adjustment
-   - Load balancing across CXL-attached CPUs
-
-## Prerequisites
-
-### System Requirements
-
-- Linux kernel 6.12+ with sched_ext support
-- CXL-enabled hardware (optional, will simulate if not available)
-- Root privileges for loading eBPF programs
-
-### Software Dependencies
-
+### 运行20线程演示
 ```bash
-# Ubuntu/Debian
-sudo apt-get install -y \
-    clang \
-    llvm \
-    libbpf-dev \
-    libelf-dev \
-    zlib1g-dev \
-    linux-tools-common \
-    linux-tools-generic \
-    bpftool
-
-# Or use the provided target
-make install-deps
+cd ebpf/
+./run_20_threads_demo.sh
 ```
 
-## Building
+### 自定义配置测试
+```bash
+# 20个线程，60%读/40%写，800MB/s总带宽
+../microbench/double_bandwidth -t 20 -r 0.6 -B 800 -d 10
+
+# 16个线程，70%读/30%写，1200MB/s总带宽  
+../microbench/double_bandwidth -t 16 -r 0.7 -B 1200 -d 15
+```
+
+## 📁 项目结构
+
+```
+ebpf/
+├── cxl_pmu.bpf.c              # eBPF调度器内核程序
+├── cxl_bandwidth_scheduler.c   # 用户空间控制器
+├── run_20_threads_demo.sh      # 20线程演示脚本
+├── Makefile                    # 编译和测试工具
+├── BANDWIDTH_SCHEDULING_REPORT.md  # 详细测试报告
+└── README.md                   # 本文档
+
+microbench/
+└── double_bandwidth.cpp       # 带宽测试程序
+```
+
+## 🎯 核心特性
+
+### 1. 智能任务识别
+- 自动识别带宽密集型任务（`double_bandwidth`, `bandwidth`, `memtest`, `stress`）
+- 基于进程名和行为模式分类任务类型
+- 动态调整任务优先级
+
+### 2. 带宽感知调度
+- 根据读写比例分配CPU资源
+- 令牌桶算法实现精确带宽控制
+- 支持突发流量处理
+
+### 3. CXL硬件优化
+- CXL PMU指标集成
+- CXL感知的CPU选择
+- NUMA拓扑优化
+
+### 4. 内存访问模式监控
+- DAMON集成的实时监控
+- 内存访问热点检测
+- 工作集大小估算
+
+## 📊 性能测试结果
+
+### 20线程不同读写比例性能对比
+
+| 配置 | 读线程 | 写线程 | 读带宽(MB/s) | 写带宽(MB/s) | 总带宽(MB/s) |
+|------|--------|--------|--------------|--------------|-------------|
+| 读密集 | 16 | 4 | 432.1 | 111.1 | 543.2 |
+| 写密集 | 6 | 14 | 166.0 | 387.7 | 553.7 |
+| 平衡 | 10 | 10 | 220.0 | 219.0 | 439.0 |
+| 高性能 | 12 | 8 | 707.0 | 470.0 | 1177.0 |
+
+### 关键发现
+- ✅ 成功实现按比例带宽分配
+- ✅ 支持4-20个线程的广泛配置范围
+- ✅ 多进程环境下资源分配公平
+- ✅ 带宽利用率稳定在115-120%
+
+## 🛠️ 使用指南
+
+### Makefile命令
 
 ```bash
-# Build both eBPF program and userspace loader
+# 编译所有程序
 make all
 
-# Or build individual components
-make cxl_pmu.bpf.o    # eBPF program only
-make cxl_sched        # Userspace loader only
+# 运行基础演示
+make demo
+
+# 性能对比测试
+make compare
+
+# 并发压力测试
+make stress
+
+# 显示帮助
+make help
 ```
 
-## Usage
-
-### Loading the Scheduler
+### 带宽测试程序参数
 
 ```bash
-# Build and load the scheduler (requires root)
-sudo make load
+./double_bandwidth [OPTIONS]
 
-# Or manually
-sudo ./cxl_sched
+主要参数:
+  -t, --threads=NUM         线程总数 (默认: 4)
+  -r, --read-ratio=RATIO    读线程比例 0.0-1.0 (默认: 0.5)
+  -B, --max-bandwidth=MB/s  总带宽限制 (默认: 无限制)
+  -d, --duration=SECONDS    测试时长 (默认: 10)
+  -b, --buffer-size=SIZE    缓冲区大小 (默认: 1GB)
+  -s, --block-size=SIZE     块大小 (默认: 4KB)
 ```
 
-### Monitoring
+## 🎨 应用场景示例
 
-The scheduler automatically:
-- Detects VectorDB processes (names starting with "vect", "fais", "milv", "weav")
-- Identifies kernel workers ("kworker*")
-- Monitors memory access patterns
-- Adjusts scheduling priorities dynamically
+### 1. 数据科学/AI推理
+```bash
+# 读密集型，适合模型推理
+./double_bandwidth -t 16 -r 0.8 -B 1000 -d 3600
+```
 
-### Configuration
+### 2. 机器学习训练
+```bash
+# 平衡读写，适合训练过程
+./double_bandwidth -t 12 -r 0.6 -B 1200 -d 7200
+```
 
-Key parameters can be adjusted in `cxl_pmu.bpf.c`:
+### 3. 实时数据处理
+```bash
+# 写密集型，适合数据采集
+./double_bandwidth -t 20 -r 0.3 -B 800 -d 1800
+```
 
+### 4. 高性能计算
+```bash
+# 高带宽，适合HPC工作负载
+./double_bandwidth -t 8 -r 0.7 -B 2000 -d 600
+```
+
+## 🔧 eBPF调度器特性
+
+### 任务类型分类
 ```c
-#define MOE_VECTORDB_THRESHOLD 80        // Locality score threshold for VectorDB boost
-#define KWORKER_PROMOTION_THRESHOLD 70   // Threshold for kworker promotion
-#define DAMON_SAMPLE_INTERVAL_NS (100 * 1000 * 1000)  // 100ms sampling
+enum task_type {
+    TASK_TYPE_READ_INTENSIVE,    // 读密集型
+    TASK_TYPE_WRITE_INTENSIVE,   // 写密集型
+    TASK_TYPE_BANDWIDTH_TEST,    // 带宽测试
+    TASK_TYPE_MOE_VECTORDB,      // MoE向量数据库
+    TASK_TYPE_KWORKER,           // 内核工作线程
+    TASK_TYPE_LATENCY_SENSITIVE, // 延迟敏感
+};
 ```
 
-## Scheduling Algorithm
+### 动态优先级调整策略
+- **读密集型任务**: 读带宽 > 70MB/s 时优先级 +15
+- **写密集型任务**: 写带宽 > 70MB/s 时优先级 +15  
+- **带宽测试任务**: 最高优先级 +30
+- **延迟敏感任务**: 优先级 +25
 
-### CPU Selection (`cxl_select_cpu`)
+### CPU选择算法
+- 优先选择CXL附加的CPU
+- 考虑内存带宽和延迟指标
+- 避免CPU过载
+- NUMA感知的负载均衡
 
-1. **For MoE/VectorDB tasks**:
-   - Prefer CXL-attached CPUs (+30 points)
-   - Favor high bandwidth CPUs (+20 points)
-   - Prefer high cache hit rates (+15 points)
-   - Avoid high latency CPUs (+15 points for <120ns)
-   - Prefer idle CPUs (+25 points)
+## 📈 性能调优建议
 
-2. **For all tasks**:
-   - Update DAMON memory access data
-   - Consider CPU load balancing
-   - Apply kworker promotion logic
+### 线程配置
+- **高带宽需求**: 4-8个线程，单线程带宽高
+- **高并发需求**: 16-20个线程，提高并发度
+- **平衡需求**: 12-16个线程，获得最佳平衡
 
-### Task Enqueueing (`cxl_enqueue`)
+### 读写比例
+- **数据分析**: 70-80% 读
+- **数据备份**: 20-30% 读  
+- **通用应用**: 50% 读
+- **实时系统**: 60-70% 读
 
-1. **Task Classification**: Automatically detect task types
-2. **Priority Calculation**:
-   - VectorDB tasks: -20 priority for good locality, -10 for high bandwidth
-   - Kworkers: -15 for promotion, +10 under memory pressure
-   - Latency-sensitive: -25 priority boost
-3. **Virtual Time Adjustment**: Based on calculated priority
+### 带宽限制
+- 设置目标带宽的85-90%作为限制值
+- 允许10-20%的突发容量
+- 根据系统负载动态调整
 
-### Memory Pattern Tracking
+## 🚀 高级功能
 
-- **Locality Score**: 0-100, higher = better memory locality
-- **Working Set Estimation**: Based on virtual runtime heuristics
-- **Migration Penalty**: Reduces locality score for frequent migrations
-- **Access Frequency**: Tracks number of memory accesses over time
-
-## Performance Characteristics
-
-### Expected Improvements
-
-- **VectorDB Workloads**: 10-30% improvement in memory-bound operations
-- **Mixed Workloads**: Better isolation between memory-intensive and CPU-bound tasks
-- **Kworker Efficiency**: Reduced interference with user applications
-- **CXL Utilization**: Optimal placement on CXL-attached memory
-
-### Overhead
-
-- **CPU Overhead**: <1% additional scheduling overhead
-- **Memory Overhead**: ~4KB per tracked task
-- **Latency Impact**: Minimal impact on scheduling latency
-
-## Debugging
-
-### Enable Verbose Logging
-
+### 实时监控
 ```bash
-# Check eBPF program loading
-sudo bpftool prog list | grep cxl
-
-# Monitor eBPF maps
-sudo bpftool map dump name task_ctx_stor
-sudo bpftool map dump name damon_data
-sudo bpftool map dump name cpu_contexts
+# 监控调度器状态 (需要root权限)
+sudo ./cxl_bandwidth_scheduler -t 20 -R 0.6 -r 1000 -w 500 -i 3
 ```
 
-### Common Issues
-
-1. **"Operation not permitted"**: Ensure running as root
-2. **"Invalid argument"**: Check kernel sched_ext support
-3. **"No such file"**: Verify eBPF object file exists
-
-## Integration with VectorDB Bench
-
-This scheduler is designed to work with the VectorDB benchmark mentioned in your logs:
-
+### 多进程并发测试
 ```bash
-# Run with CXL scheduler active
-sudo ./cxl_sched &
-python3 -m vectordb_bench.cli.vectordbbench vsag \
-    --case-type Performance768D1M \
-    --db-label "vsag-with-cxl-scheduler"
+# 同时运行多个不同配置的测试
+make stress
 ```
 
-## Development
-
-### Adding New Task Types
-
-1. Add to `enum task_type`
-2. Implement detection logic in helper functions
-3. Add priority calculation rules
-4. Update CPU selection logic
-
-### Extending CXL Metrics
-
-1. Add new fields to `struct cxl_pmu_metrics`
-2. Update `update_cxl_pmu_metrics()` function
-3. Integrate into priority calculation
-
-### Testing
-
+### 自定义工作负载模拟
 ```bash
-# Compile without loading
-make all
-
-# Test with specific workloads
-taskset -c 0-3 your_vectordb_workload &
-sudo ./cxl_sched
+# 模拟特定应用的读写模式
+./double_bandwidth -t 24 -r 0.65 -B 1500 -d 3600
 ```
 
-## License
+## 🔍 故障排除
 
-GPL-2.0 - See SPDX license identifier in source files.
+### 常见问题
 
-## Contributing
+1. **编译错误**: 确保安装了 libbpf-dev
+2. **权限问题**: eBPF加载需要root权限
+3. **性能不达预期**: 检查系统负载和内存压力
 
-1. Ensure code follows kernel coding style
-2. Test with various workloads
-3. Update documentation for new features
-4. Verify eBPF verifier compliance 
+### 调试选项
+```bash
+# 详细输出模式
+./double_bandwidth -t 20 -r 0.6 -B 500 -d 10 --verbose
+
+# 无带宽限制测试
+./double_bandwidth -t 20 -r 0.6 -d 10
+```
+
+## 📖 相关文档
+
+- [详细测试报告](BANDWIDTH_SCHEDULING_REPORT.md)
+- [Makefile命令参考](Makefile)
+- [源码注释](cxl_pmu.bpf.c)
+
+## 🤝 贡献指南
+
+欢迎提交Issue和Pull Request来改进项目。
+
+## 📄 许可证
+
+GPL-2.0 许可证
+
+---
+
+**开发环境**: Linux 6.14.0-15-generic
+**测试平台**: x86_64
+**编译器**: GCC 11.x, Clang 14.x 

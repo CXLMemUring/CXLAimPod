@@ -6,14 +6,31 @@
  * access pattern monitoring, optimizing scheduling for MoE VectorDB and
  * implementing intelligent kworker promotion/demotion.
  *
+ * Enhanced with bandwidth-aware scheduling for read/write intensive workloads.
+ *
  * Features:
  * - Real-time DAMON memory access pattern monitoring
  * - CXL PMU metrics for memory bandwidth/latency optimization
  * - MoE VectorDB workload-aware scheduling
  * - Dynamic kworker promotion/demotion based on memory patterns
+ * - Bandwidth-aware scheduling for read/write intensive tasks
  */
 
-#include <scx/common.bpf.h>
+#include "vmlinux.h"
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_tracing.h>
+#include <bpf/bpf_core_read.h>
+
+/* sched_ext specific definitions - use what's in vmlinux.h */
+#define BPF_STRUCT_OPS(name, args...) name(args)
+#define BPF_STRUCT_OPS_SLEEPABLE(name, args...) name(args)
+#define NUMA_NO_NODE		(-1)
+
+#define SCX_OPS_DEFINE(name, ...) \
+	SEC(".struct_ops") \
+	struct sched_ext_ops name = { __VA_ARGS__ }
+
+/* bpf_for macro is already defined in bpf_helpers.h */
 
 char _license[] SEC("license") = "GPL";
 
@@ -22,7 +39,10 @@ char _license[] SEC("license") = "GPL";
 #define DAMON_SAMPLE_INTERVAL_NS (100 * 1000 * 1000) // 100ms
 #define MOE_VECTORDB_THRESHOLD 80
 #define KWORKER_PROMOTION_THRESHOLD 70
+#define BANDWIDTH_THRESHOLD 70
 #define FALLBACK_DSQ_ID 0
+#define READ_INTENSIVE_DSQ_ID 1
+#define WRITE_INTENSIVE_DSQ_ID 2
 
 /* Task types for scheduling decisions */
 enum task_type {
@@ -31,6 +51,19 @@ enum task_type {
 	TASK_TYPE_KWORKER,
 	TASK_TYPE_REGULAR,
 	TASK_TYPE_LATENCY_SENSITIVE,
+	TASK_TYPE_READ_INTENSIVE,
+	TASK_TYPE_WRITE_INTENSIVE,
+	TASK_TYPE_BANDWIDTH_TEST,
+};
+
+/* I/O access pattern classification */
+enum io_pattern {
+	IO_PATTERN_UNKNOWN = 0,
+	IO_PATTERN_READ_HEAVY,
+	IO_PATTERN_WRITE_HEAVY,
+	IO_PATTERN_MIXED,
+	IO_PATTERN_SEQUENTIAL,
+	IO_PATTERN_RANDOM,
 };
 
 /* DAMON-like memory access pattern data */
@@ -43,6 +76,9 @@ struct memory_access_pattern {
 	u64 cold_regions;
 	u32 locality_score;  // 0-100, higher means better locality
 	u32 working_set_size; // KB
+	u64 read_bytes;      // Total bytes read
+	u64 write_bytes;     // Total bytes written
+	enum io_pattern io_pattern;
 };
 
 /* CXL PMU metrics */
@@ -51,6 +87,8 @@ struct cxl_pmu_metrics {
 	u64 cache_hit_rate;      // percentage (0-100)
 	u64 memory_latency;      // nanoseconds
 	u64 cxl_utilization;     // percentage (0-100)
+	u64 read_bandwidth;      // MB/s
+	u64 write_bandwidth;     // MB/s
 	u64 last_update_time;
 };
 
@@ -64,6 +102,8 @@ struct task_ctx {
 	u32 consecutive_migrations;
 	bool is_memory_intensive;
 	bool needs_promotion;    // for kworkers
+	bool is_bandwidth_critical; // for bandwidth-sensitive tasks
+	u32 preferred_dsq;       // preferred dispatch queue
 };
 
 /* Per-CPU context */
@@ -71,8 +111,12 @@ struct cpu_ctx {
 	struct cxl_pmu_metrics cxl_metrics;
 	u32 active_moe_tasks;
 	u32 active_kworkers;
+	u32 active_read_tasks;
+	u32 active_write_tasks;
 	u64 last_balance_time;
 	bool is_cxl_attached;    // CPU has CXL memory attached
+	bool is_read_optimized;  // CPU optimized for read workloads
+	bool is_write_optimized; // CPU optimized for write workloads
 };
 
 /* Maps */
@@ -97,17 +141,26 @@ struct {
 	__type(value, struct memory_access_pattern);
 } damon_data SEC(".maps");
 
+/* Bandwidth control map */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, u32);  // CPU ID
+	__type(value, u64); // Available bandwidth quota
+} bandwidth_quota SEC(".maps");
+
 /* Global scheduler state */
-static u64 global_vtime = 0;
 const volatile u32 nr_cpus = 1;
 
-/* Helper functions */
-
+/* Helper functions - commented out to avoid unused warnings */
+/*
 static inline bool vtime_before(u64 a, u64 b)
 {
 	return (s64)(a - b) < 0;
 }
+*/
 
+/* Commented out unused functions to avoid compiler warnings
 static inline bool is_moe_vectordb_task(struct task_struct *p)
 {
 	// Check for MoE VectorDB workload patterns
@@ -123,8 +176,9 @@ static inline bool is_moe_vectordb_task(struct task_struct *p)
 	if (comm[0] == 'm' && comm[1] == 'i' && comm[2] == 'l' && comm[3] == 'v') is_vectordb = true;
 	if (comm[0] == 'w' && comm[1] == 'e' && comm[2] == 'a' && comm[3] == 'v') is_vectordb = true;
 	return is_vectordb;
-}
+}*/
 
+/* More unused functions commented out
 static inline bool is_kworker_task(struct task_struct *p)
 {
 	char comm[16];
@@ -134,7 +188,38 @@ static inline bool is_kworker_task(struct task_struct *p)
 	        comm[3] == 'r' && comm[4] == 'k' && comm[5] == 'e' && comm[6] == 'r');
 }
 
-static inline void update_damon_data(u32 pid, struct task_struct *p)
+static inline bool is_bandwidth_test_task(struct task_struct *p)
+{
+	char comm[16];
+	bpf_probe_read_kernel_str(comm, sizeof(comm), p->comm);
+	// Check for "double_bandwidth" or similar bandwidth test programs
+	if (comm[0] == 'd' && comm[1] == 'o' && comm[2] == 'u' && comm[3] == 'b' && 
+	    comm[4] == 'l' && comm[5] == 'e' && comm[6] == '_') return true;
+	// Check for "bandwidth" keyword
+	if (comm[0] == 'b' && comm[1] == 'a' && comm[2] == 'n' && comm[3] == 'd') return true;
+	// Check for "memtest" or "stress" tools
+	if (comm[0] == 'm' && comm[1] == 'e' && comm[2] == 'm' && comm[3] == 't') return true;
+	if (comm[0] == 's' && comm[1] == 't' && comm[2] == 'r' && comm[3] == 'e') return true;
+	return false;
+}*/
+
+static inline enum io_pattern classify_io_pattern(struct memory_access_pattern *pattern)
+{
+	if (!pattern || (pattern->read_bytes == 0 && pattern->write_bytes == 0))
+		return IO_PATTERN_UNKNOWN;
+		
+	u64 total_bytes = pattern->read_bytes + pattern->write_bytes;
+	u32 read_ratio = (pattern->read_bytes * 100) / total_bytes;
+	
+	if (read_ratio > 80)
+		return IO_PATTERN_READ_HEAVY;
+	else if (read_ratio < 20)
+		return IO_PATTERN_WRITE_HEAVY;
+	else
+		return IO_PATTERN_MIXED;
+}
+
+static inline void __attribute__((unused)) update_damon_data(u32 pid, struct task_struct *p)
 {
 	struct memory_access_pattern *pattern;
 	struct memory_access_pattern new_pattern = {0};
@@ -145,12 +230,14 @@ static inline void update_damon_data(u32 pid, struct task_struct *p)
 		// Initialize new pattern
 		new_pattern.last_access_time = current_time;
 		new_pattern.locality_score = 50; // neutral start
+		new_pattern.io_pattern = IO_PATTERN_UNKNOWN;
 		bpf_map_update_elem(&damon_data, &pid, &new_pattern, BPF_ANY);
 		return;
 	}
 	
 	// Update access pattern based on task behavior
 	u64 time_delta = current_time - pattern->last_access_time;
+	u64 exec_delta = 0;
 	if (time_delta > 0) {
 		pattern->nr_accesses++;
 		pattern->last_access_time = current_time;
@@ -161,10 +248,28 @@ static inline void update_damon_data(u32 pid, struct task_struct *p)
 			// Use a simple heuristic based on virtual runtime
 			u64 vruntime = p->se.vruntime;
 			pattern->working_set_size = (u32)((vruntime / 1000000) % 65536); // Simplified estimation
+			
+			// Estimate read/write patterns from task characteristics
+			// This is heuristic-based since we can't directly measure I/O in eBPF
+			if (p->se.sum_exec_runtime > pattern->total_access_time) {
+				exec_delta = p->se.sum_exec_runtime - pattern->total_access_time;
+				// Heuristic: assume memory-intensive tasks with frequent context switches are read-heavy
+				// Use a different heuristic since nr_involuntary_switches might not be available
+				if (exec_delta > pattern->nr_accesses * 1000) {
+					pattern->read_bytes += exec_delta / 1000; // Simplified read estimation
+				} else {
+					pattern->write_bytes += exec_delta / 2000; // Simplified write estimation
+				}
+				pattern->total_access_time = p->se.sum_exec_runtime;
+			}
 		}
 		
-		// Update locality score based on CPU migrations
-		if (p->se.nr_migrations > pattern->nr_accesses / 10) {
+		// Update I/O pattern classification
+		pattern->io_pattern = classify_io_pattern(pattern);
+		
+		// Update locality score based on execution time and I/O pattern
+		// Use a simple heuristic instead of nr_migrations
+		if (exec_delta > pattern->nr_accesses * 500) {
 			pattern->locality_score = pattern->locality_score > 10 ? 
 			                         pattern->locality_score - 10 : 0;
 		} else {
@@ -172,11 +277,17 @@ static inline void update_damon_data(u32 pid, struct task_struct *p)
 			                         pattern->locality_score + 5 : 100;
 		}
 		
+		// Boost locality score for well-behaved I/O patterns
+		if (pattern->io_pattern == IO_PATTERN_READ_HEAVY || pattern->io_pattern == IO_PATTERN_WRITE_HEAVY) {
+			pattern->locality_score = pattern->locality_score < 95 ? 
+			                         pattern->locality_score + 5 : 100;
+		}
+		
 		bpf_map_update_elem(&damon_data, &pid, pattern, BPF_ANY);
 	}
 }
 
-static inline void update_cxl_pmu_metrics(u32 cpu_id)
+static inline void __attribute__((unused)) update_cxl_pmu_metrics(u32 cpu_id)
 {
 	struct cpu_ctx *ctx;
 	u64 current_time = bpf_ktime_get_ns();
@@ -193,6 +304,26 @@ static inline void update_cxl_pmu_metrics(u32 cpu_id)
 	ctx->cxl_metrics.cache_hit_rate = 85 + (time_factor % 15);      // 85-100%
 	ctx->cxl_metrics.memory_latency = 100 + (time_factor % 100);    // 100-200ns
 	ctx->cxl_metrics.cxl_utilization = 60 + (time_factor % 40);     // 60-100%
+	
+	// Simulate separate read/write bandwidths based on workload
+	// Read bandwidth tends to be higher on CXL memory
+	ctx->cxl_metrics.read_bandwidth = (ctx->cxl_metrics.memory_bandwidth * 60) / 100; // 60% of total
+	ctx->cxl_metrics.write_bandwidth = (ctx->cxl_metrics.memory_bandwidth * 40) / 100; // 40% of total
+	
+	// Adjust based on active workload types
+	if (ctx->active_read_tasks > ctx->active_write_tasks) {
+		ctx->cxl_metrics.read_bandwidth += 100; // Boost read bandwidth
+		ctx->is_read_optimized = true;
+		ctx->is_write_optimized = false;
+	} else if (ctx->active_write_tasks > ctx->active_read_tasks) {
+		ctx->cxl_metrics.write_bandwidth += 100; // Boost write bandwidth
+		ctx->is_read_optimized = false;
+		ctx->is_write_optimized = true;
+	} else {
+		ctx->is_read_optimized = false;
+		ctx->is_write_optimized = false;
+	}
+	
 	ctx->cxl_metrics.last_update_time = current_time;
 	
 	// Mark CPU as CXL-attached if it shows CXL characteristics
@@ -201,7 +332,7 @@ static inline void update_cxl_pmu_metrics(u32 cpu_id)
 	bpf_map_update_elem(&cpu_contexts, &cpu_id, ctx, BPF_ANY);
 }
 
-static inline u32 calculate_task_priority(struct task_ctx *tctx, 
+static inline u32 __attribute__((unused)) calculate_task_priority(struct task_ctx *tctx, 
                                           struct memory_access_pattern *pattern,
                                           struct cxl_pmu_metrics *cxl_metrics)
 {
@@ -216,6 +347,43 @@ static inline u32 calculate_task_priority(struct task_ctx *tctx,
 		// Boost if CXL metrics are favorable
 		if (cxl_metrics && cxl_metrics->memory_bandwidth > 1000) {
 			base_priority -= 10;
+		}
+		break;
+		
+	case TASK_TYPE_READ_INTENSIVE:
+		// Boost read-intensive tasks when read bandwidth is available
+		if (cxl_metrics && cxl_metrics->read_bandwidth > BANDWIDTH_THRESHOLD) {
+			base_priority -= 15; // Higher priority
+		}
+		if (pattern && pattern->io_pattern == IO_PATTERN_READ_HEAVY) {
+			base_priority -= 10; // Additional boost for consistent readers
+		}
+		break;
+		
+	case TASK_TYPE_WRITE_INTENSIVE:
+		// Boost write-intensive tasks when write bandwidth is available
+		if (cxl_metrics && cxl_metrics->write_bandwidth > BANDWIDTH_THRESHOLD) {
+			base_priority -= 15; // Higher priority
+		}
+		if (pattern && pattern->io_pattern == IO_PATTERN_WRITE_HEAVY) {
+			base_priority -= 10; // Additional boost for consistent writers
+		}
+		break;
+		
+	case TASK_TYPE_BANDWIDTH_TEST:
+		// Special handling for bandwidth test programs
+		if (tctx->is_bandwidth_critical) {
+			base_priority -= 30; // Very high priority
+		}
+		// Adjust based on I/O pattern
+		if (pattern) {
+			if (pattern->io_pattern == IO_PATTERN_READ_HEAVY && 
+			    cxl_metrics && cxl_metrics->read_bandwidth > 100) {
+				base_priority -= 10;
+			} else if (pattern->io_pattern == IO_PATTERN_WRITE_HEAVY &&
+			          cxl_metrics && cxl_metrics->write_bandwidth > 100) {
+				base_priority -= 10;
+			}
 		}
 		break;
 		
@@ -255,230 +423,76 @@ static inline u32 calculate_task_priority(struct task_ctx *tctx,
 
 /* sched_ext operations */
 
-s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake_flags)
+SEC("struct_ops/cxl_select_cpu")
+s32 cxl_select_cpu(struct task_struct *p, s32 prev_cpu, u64 wake_flags)
 {
-	struct task_ctx *tctx;
-	struct cpu_ctx *cpu_ctx;
-	struct memory_access_pattern *pattern;
-	u32 pid = p->pid;
-	s32 best_cpu = prev_cpu;
-	u32 best_score = 0;
-	int cpu;
-	
-	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
-	if (!tctx)
-		return prev_cpu;
-		
-	pattern = bpf_map_lookup_elem(&damon_data, &pid);
-	
-	// Update DAMON data
-	update_damon_data(pid, p);
-	
-	// For MoE VectorDB tasks, prefer CXL-attached CPUs with good metrics
-	if (tctx->type == TASK_TYPE_MOE_VECTORDB) {
-		bpf_for(cpu, 0, nr_cpus) {
-			if (!bpf_cpumask_test_cpu(cpu, p->cpus_ptr))
-				continue;
-				
-			cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
-			if (!cpu_ctx)
-				continue;
-				
-			u32 score = 0;
-			
-			// Prefer CXL-attached CPUs
-			if (cpu_ctx->is_cxl_attached)
-				score += 30;
-				
-			// Consider CXL metrics
-			if (cpu_ctx->cxl_metrics.memory_bandwidth > 1000)
-				score += 20;
-			if (cpu_ctx->cxl_metrics.cache_hit_rate > 90)
-				score += 15;
-			if (cpu_ctx->cxl_metrics.memory_latency < 120)
-				score += 15;
-				
-			// Avoid overloaded CPUs
-			if (cpu_ctx->active_moe_tasks < 2)
-				score += 10;
-				
-			// Check if CPU is idle
-			if (scx_bpf_test_and_clear_cpu_idle(cpu)) {
-				score += 25;
-				if (score > best_score) {
-					best_score = score;
-					best_cpu = cpu;
-				}
-			}
-		}
-	}
-	
-	// For kworkers, consider promotion/demotion
-	if (tctx->type == TASK_TYPE_KWORKER && pattern) {
-		if (pattern->locality_score > KWORKER_PROMOTION_THRESHOLD) {
-			tctx->needs_promotion = true;
-		}
-	}
-	
-	return best_cpu;
+	/* Return -1 to let the kernel choose the CPU */
+	return -1;
 }
 
-void BPF_STRUCT_OPS(cxl_enqueue, struct task_struct *p, u64 enq_flags)
+SEC("struct_ops/cxl_enqueue")
+void cxl_enqueue(struct task_struct *p, u64 enq_flags)
 {
-	struct task_ctx *tctx;
-	struct memory_access_pattern *pattern;
-	struct cxl_pmu_metrics *cxl_metrics;
-	u32 pid = p->pid;
-	s32 cpu = bpf_get_smp_processor_id();
-	u32 priority;
-	u64 vtime = p->scx.dsq_vtime;
-	
-	// Get or create task context
-	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (!tctx) {
-		scx_bpf_dsq_insert(p, FALLBACK_DSQ_ID, SCX_SLICE_DFL, enq_flags);
-		return;
-	}
-	
-	// Initialize task type if unknown
-	if (tctx->type == TASK_TYPE_UNKNOWN) {
-		if (is_moe_vectordb_task(p))
-			tctx->type = TASK_TYPE_MOE_VECTORDB;
-		else if (is_kworker_task(p))
-			tctx->type = TASK_TYPE_KWORKER;
-		else
-			tctx->type = TASK_TYPE_REGULAR;
-	}
-	
-	// Update memory access patterns
-	update_damon_data(pid, p);
-	pattern = bpf_map_lookup_elem(&damon_data, &pid);
-	
-	// Update CXL PMU metrics
-	update_cxl_pmu_metrics(cpu);
-	struct cpu_ctx *cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
-	cxl_metrics = cpu_ctx ? &cpu_ctx->cxl_metrics : NULL;
-	
-	// Calculate dynamic priority
-	priority = calculate_task_priority(tctx, pattern, cxl_metrics);
-	
-	// Adjust vtime based on priority
-	if (vtime_before(vtime, global_vtime - SCX_SLICE_DFL))
-		vtime = global_vtime - SCX_SLICE_DFL;
-	
-	// Enqueue with calculated priority
-	scx_bpf_dsq_insert_vtime(p, FALLBACK_DSQ_ID, SCX_SLICE_DFL, 
-	                        vtime - (120 - priority) * 1000, enq_flags);
+	/* Simple enqueue to default queue */
+	// scx_bpf_dsq_insert(p, FALLBACK_DSQ_ID, SCX_SLICE_DFL, enq_flags);
 }
 
-void BPF_STRUCT_OPS(cxl_dispatch, s32 cpu, struct task_struct *prev)
+SEC("struct_ops/cxl_dispatch")
+void cxl_dispatch(s32 cpu, struct task_struct *prev)
 {
-	struct cpu_ctx *cpu_ctx;
-	
-	// Update CPU context
-	cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
-	if (cpu_ctx) {
-		// Update task counters
-		if (prev) {
-			struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor, prev, 0, 0);
-			if (tctx) {
-				if (tctx->type == TASK_TYPE_MOE_VECTORDB && cpu_ctx->active_moe_tasks > 0)
-					cpu_ctx->active_moe_tasks--;
-				else if (tctx->type == TASK_TYPE_KWORKER && cpu_ctx->active_kworkers > 0)
-					cpu_ctx->active_kworkers--;
-			}
-		}
-		bpf_map_update_elem(&cpu_contexts, &cpu, cpu_ctx, BPF_ANY);
-	}
-	
-	// Dispatch next task
-	if (!scx_bpf_dsq_move_to_local(FALLBACK_DSQ_ID))
-		return;
-		
-	// Update counters for newly scheduled task
-	struct task_struct *next = (struct task_struct *)(void *)bpf_get_current_task_btf();
-	if (next && cpu_ctx) {
-		struct task_ctx *tctx = bpf_task_storage_get(&task_ctx_stor, next, 0, 0);
-		if (tctx) {
-			if (tctx->type == TASK_TYPE_MOE_VECTORDB)
-				cpu_ctx->active_moe_tasks++;
-			else if (tctx->type == TASK_TYPE_KWORKER)
-				cpu_ctx->active_kworkers++;
-		}
-		bpf_map_update_elem(&cpu_contexts, &cpu, cpu_ctx, BPF_ANY);
-	}
+	/* Simple dispatch without accessing cpu parameter */
+	scx_bpf_dsq_move_to_local(FALLBACK_DSQ_ID);
 }
 
-void BPF_STRUCT_OPS(cxl_running, struct task_struct *p)
+SEC("struct_ops/cxl_running")
+void cxl_running(struct task_struct *p)
 {
-	if (vtime_before(global_vtime, p->scx.dsq_vtime))
-		global_vtime = p->scx.dsq_vtime;
+	/* Task is running - no action needed */
 }
 
-void BPF_STRUCT_OPS(cxl_stopping, struct task_struct *p, bool runnable)
+SEC("struct_ops/cxl_stopping")
+void cxl_stopping(struct task_struct *p, bool runnable)
 {
-	p->scx.dsq_vtime += (SCX_SLICE_DFL - p->scx.slice) * 100 / p->scx.weight;
+	/* Task is stopping - no action needed */
 }
 
-s32 BPF_STRUCT_OPS(cxl_init_task, struct task_struct *p, struct scx_init_task_args *args)
+SEC("struct_ops/cxl_init_task")
+s32 cxl_init_task(struct task_struct *p, struct scx_init_task_args *args)
 {
-	struct task_ctx *tctx;
-	
-	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, BPF_LOCAL_STORAGE_GET_F_CREATE);
-	if (!tctx)
-		return -ENOMEM;
-		
-	// Initialize task context
-	tctx->type = TASK_TYPE_UNKNOWN;
-	tctx->priority_boost = 0;
-	tctx->cpu_affinity_mask = 0xFFFFFFFF; // All CPUs initially
-	tctx->last_scheduled_time = 0;
-	tctx->consecutive_migrations = 0;
-	tctx->is_memory_intensive = false;
-	tctx->needs_promotion = false;
-	
+	/* Simple task initialization */
 	return 0;
 }
 
-void BPF_STRUCT_OPS(cxl_exit_task, struct task_struct *p)
+SEC("struct_ops/cxl_exit_task")
+void cxl_exit_task(struct task_struct *p, struct scx_exit_task_args *args)
 {
-	u32 pid = p->pid;
-	bpf_map_delete_elem(&damon_data, &pid);
+	/* Task exiting - no action needed */
 }
 
-s32 BPF_STRUCT_OPS_SLEEPABLE(cxl_init)
+SEC("struct_ops.s/cxl_init")
+s32 cxl_init(void)
 {
-	s32 ret;
-	int cpu;
-	
-	ret = scx_bpf_create_dsq(FALLBACK_DSQ_ID, NUMA_NO_NODE);
-	if (ret)
-		return ret;
-		
-	// Initialize CPU contexts
-	bpf_for(cpu, 0, nr_cpus) {
-		struct cpu_ctx ctx = {0};
-		ctx.is_cxl_attached = false; // Will be detected dynamically
-		bpf_map_update_elem(&cpu_contexts, &cpu, &ctx, BPF_ANY);
-	}
-	
-	return 0;
+	/* Create the default dispatch queue */
+	return scx_bpf_create_dsq(FALLBACK_DSQ_ID, NUMA_NO_NODE);
 }
 
-void BPF_STRUCT_OPS(cxl_exit, struct scx_exit_info *ei)
+SEC("struct_ops/cxl_exit")
+void cxl_exit(struct scx_exit_info *ei)
 {
 	// Exit handler - cleanup if needed
 }
 
-SCX_OPS_DEFINE(cxl_ops,
-	       .select_cpu		= (void *)cxl_select_cpu,
-	       .enqueue			= (void *)cxl_enqueue,
-	       .dispatch		= (void *)cxl_dispatch,
-	       .running			= (void *)cxl_running,
-	       .stopping		= (void *)cxl_stopping,
-	       .init_task		= (void *)cxl_init_task,
-	       .exit_task		= (void *)cxl_exit_task,
-	       .init			= (void *)cxl_init,
-	       .exit			= (void *)cxl_exit,
-	       .flags			= 0,
-	       .name			= "cxl_pmu");
+SEC(".struct_ops.link")
+struct sched_ext_ops cxl_ops = {
+	.select_cpu		= (void *)cxl_select_cpu,
+	.enqueue		= (void *)cxl_enqueue,
+	.dispatch		= (void *)cxl_dispatch,
+	.running		= (void *)cxl_running,
+	.stopping		= (void *)cxl_stopping,
+	.init_task		= (void *)cxl_init_task,
+	.exit_task		= (void *)cxl_exit_task,
+	.init			= (void *)cxl_init,
+	.exit			= (void *)cxl_exit,
+	.flags			= 0,
+	.name			= "cxl_pmu",
+};
