@@ -16,21 +16,11 @@
  * - Bandwidth-aware scheduling for read/write intensive tasks
  */
 
-#include "vmlinux.h"
-#include <bpf/bpf_helpers.h>
-#include <bpf/bpf_tracing.h>
-#include <bpf/bpf_core_read.h>
-
-/* sched_ext specific definitions - use what's in vmlinux.h */
-#define BPF_STRUCT_OPS(name, args...) name(args)
-#define BPF_STRUCT_OPS_SLEEPABLE(name, args...) name(args)
-#define NUMA_NO_NODE		(-1)
-
-#define SCX_OPS_DEFINE(name, ...) \
-	SEC(".struct_ops") \
-	struct sched_ext_ops name = { __VA_ARGS__ }
-
-/* bpf_for macro is already defined in bpf_helpers.h */
+/* 
+ * Include common BPF header like cxl_pmu_minimal.bpf.c does
+ * without any additional guards which can cause redefinition issues
+ */
+#include <scx/common.bpf.h>
 
 char _license[] SEC("license") = "GPL";
 

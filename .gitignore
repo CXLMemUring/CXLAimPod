@@ -31,3 +31,7 @@ ktransformers*
 .idea
 cmake-*
 DeepSeek*
+*.md
+cxl_sched
+*.o
+profiler
