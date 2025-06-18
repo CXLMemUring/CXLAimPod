@@ -14,9 +14,14 @@
 #include <iostream>
 #include <mutex>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
+
+// 添加gettid函数，用于获取Linux线程ID
+pid_t gettid() { return syscall(SYS_gettid); }
 
 // Default parameters
 constexpr size_t DEFAULT_BUFFER_SIZE = 1 * 1024 * 1024 * 1024UL; // 1GB
@@ -29,6 +34,7 @@ constexpr size_t DEFAULT_MAX_BANDWIDTH = 0; // 0 means unlimited (MB/s)
 struct ThreadStats {
   size_t bytes_processed = 0;
   size_t operations = 0;
+  int thread_id = 0; // 新增：线程ID
 };
 
 // Rate limiter using token bucket algorithm
@@ -187,9 +193,16 @@ BenchmarkConfig parse_args(int argc, char *argv[]) {
 
 void reader_thread(void *buffer, size_t buffer_size, size_t block_size,
                    std::atomic<bool> &stop_flag, ThreadStats &stats,
-                   RateLimiter *rate_limiter) {
+                   RateLimiter *rate_limiter, int thread_id) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "Reader thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -212,9 +225,16 @@ void reader_thread(void *buffer, size_t buffer_size, size_t block_size,
 
 void writer_thread(void *buffer, size_t buffer_size, size_t block_size,
                    std::atomic<bool> &stop_flag, ThreadStats &stats,
-                   RateLimiter *rate_limiter) {
+                   RateLimiter *rate_limiter, int thread_id) {
   std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "Writer thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -237,9 +257,16 @@ void writer_thread(void *buffer, size_t buffer_size, size_t block_size,
 
 void device_reader_thread(int fd, size_t file_size, size_t block_size,
                           std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          RateLimiter *rate_limiter) {
+                          RateLimiter *rate_limiter, int thread_id) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "Device reader thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -269,9 +296,16 @@ void device_reader_thread(int fd, size_t file_size, size_t block_size,
 
 void device_writer_thread(int fd, size_t file_size, size_t block_size,
                           std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          RateLimiter *rate_limiter) {
-  std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
+                          RateLimiter *rate_limiter, int thread_id) {
+  std::vector<char> local_buffer(block_size, 'W');
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "Device writer thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -300,9 +334,16 @@ void device_writer_thread(int fd, size_t file_size, size_t block_size,
 
 void mmap_reader_thread(void *mapped_area, size_t file_size, size_t block_size,
                         std::atomic<bool> &stop_flag, ThreadStats &stats,
-                        RateLimiter *rate_limiter) {
+                        RateLimiter *rate_limiter, int thread_id) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "MMAP reader thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -325,9 +366,16 @@ void mmap_reader_thread(void *mapped_area, size_t file_size, size_t block_size,
 
 void mmap_writer_thread(void *mapped_area, size_t file_size, size_t block_size,
                         std::atomic<bool> &stop_flag, ThreadStats &stats,
-                        RateLimiter *rate_limiter) {
-  std::vector<char> local_buffer(block_size, 'W'); // Fill with 'W' for writers
+                        RateLimiter *rate_limiter, int thread_id) {
+  std::vector<char> local_buffer(block_size, 'W');
   size_t offset = 0;
+
+  // 保存线程ID用于调度和统计
+  stats.thread_id = thread_id;
+
+  // 打印线程ID以便调试
+  std::cout << "MMAP writer thread started with ID: " << thread_id
+            << " (TID: " << gettid() << ")" << std::endl;
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Wait for rate limiter tokens
@@ -429,16 +477,20 @@ int main(int argc, char *argv[]) {
 
       // Create reader and writer threads for memory
       for (int i = 0; i < num_readers; i++) {
+        int reader_id = i * 2; // 生成偶数ID: 0, 2, 4, ...
         threads.emplace_back(reader_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
-                             std::ref(thread_stats[i]), read_limiter.get());
+                             std::ref(thread_stats[i]), read_limiter.get(),
+                             reader_id);
       }
 
+      // 为写线程分配奇数ID (1, 3, 5...)
       for (int i = 0; i < num_writers; i++) {
+        int writer_id = i * 2 + 1; // 生成奇数ID: 1, 3, 5, ...
         threads.emplace_back(writer_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
                              std::ref(thread_stats[num_readers + i]),
-                             write_limiter.get());
+                             write_limiter.get(), writer_id);
       }
     } else {
       // Open the device
@@ -461,32 +513,42 @@ int main(int argc, char *argv[]) {
         }
 
         // Create reader and writer threads for mmap
+        // 为读线程分配偶数ID
         for (int i = 0; i < num_readers; i++) {
+          int reader_id = i * 2; // 生成偶数ID: 0, 2, 4, ...
           threads.emplace_back(mmap_reader_thread, mapped_area,
                                config.buffer_size, config.block_size,
                                std::ref(stop_flag), std::ref(thread_stats[i]),
-                               read_limiter.get());
+                               read_limiter.get(), reader_id);
         }
 
+        // 为写线程分配奇数ID
         for (int i = 0; i < num_writers; i++) {
-          threads.emplace_back(
-              mmap_writer_thread, mapped_area, config.buffer_size,
-              config.block_size, std::ref(stop_flag),
-              std::ref(thread_stats[num_readers + i]), write_limiter.get());
+          int writer_id = i * 2 + 1; // 生成奇数ID: 1, 3, 5, ...
+          threads.emplace_back(mmap_writer_thread, mapped_area,
+                               config.buffer_size, config.block_size,
+                               std::ref(stop_flag),
+                               std::ref(thread_stats[num_readers + i]),
+                               write_limiter.get(), writer_id);
         }
       } else {
         // Use read/write for device access
+        // 为读线程分配偶数ID
         for (int i = 0; i < num_readers; i++) {
+          int reader_id = i * 2; // 生成偶数ID: 0, 2, 4, ...
           threads.emplace_back(device_reader_thread, fd, config.buffer_size,
                                config.block_size, std::ref(stop_flag),
-                               std::ref(thread_stats[i]), read_limiter.get());
+                               std::ref(thread_stats[i]), read_limiter.get(),
+                               reader_id);
         }
 
+        // 为写线程分配奇数ID
         for (int i = 0; i < num_writers; i++) {
+          int writer_id = i * 2 + 1; // 生成奇数ID: 1, 3, 5, ...
           threads.emplace_back(device_writer_thread, fd, config.buffer_size,
                                config.block_size, std::ref(stop_flag),
                                std::ref(thread_stats[num_readers + i]),
-                               write_limiter.get());
+                               write_limiter.get(), writer_id);
         }
       }
     }
