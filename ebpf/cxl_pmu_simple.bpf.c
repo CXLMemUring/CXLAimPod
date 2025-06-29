@@ -234,7 +234,7 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 			// 备选CPU 3
 			cpu = 3;
 			if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
-				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
+		cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
 				if (cpu_ctx && scx_bpf_test_and_clear_cpu_idle(cpu)) {
 					return cpu;
 				}
@@ -245,8 +245,8 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 		for (cpu = 0; cpu < 4 && cpu < nr_cpus; cpu++) {
 			// 只考虑与线程ID奇偶性匹配的CPU
 			if ((cpu % 2) != (is_even_thread ? 0 : 1))
-				continue;
-				
+			continue;
+			
 			if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
 				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
 				if (cpu_ctx) {
@@ -259,7 +259,7 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 	
 	// Ultra-simple CPU selection - NO LOOPS
 	// For VectorDB tasks, check each CPU individually
-	if (tctx->type == TASK_TYPE_MOE_VECTORDB) {
+		if (tctx->type == TASK_TYPE_MOE_VECTORDB) {
 		// Check CPU 0
 		cpu = 0;
 		if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {

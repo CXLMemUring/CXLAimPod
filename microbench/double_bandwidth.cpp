@@ -9,10 +9,12 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <iostream>
 #include <mutex>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -23,11 +25,45 @@
 // 添加gettid函数，用于获取Linux线程ID
 pid_t gettid() { return syscall(SYS_gettid); }
 
+// CPU亲和性设置函数
+bool set_cpu_affinity(int thread_id) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+
+  // 根据线程ID的奇偶性分配CPU核心
+  // 偶数ID（读线程）-> 偶数核心，奇数ID（写线程）-> 奇数核心
+  int num_cpus = std::thread::hardware_concurrency();
+
+  if (thread_id % 2 == 0) {
+    // 偶数ID：分配到偶数核心
+    for (int i = 0; i < num_cpus; i += 2) {
+      CPU_SET(i, &cpuset);
+    }
+  } else {
+    // 奇数ID：分配到奇数核心
+    for (int i = 1; i < num_cpus; i += 2) {
+      CPU_SET(i, &cpuset);
+    }
+  }
+
+  int result = sched_setaffinity(gettid(), sizeof(cpu_set_t), &cpuset);
+  if (result != 0) {
+    std::cerr << "Warning: Failed to set CPU affinity for thread " << thread_id
+              << " (TID: " << gettid() << "): " << strerror(errno) << std::endl;
+    return false;
+  }
+
+  std::cout << "Thread " << thread_id << " (TID: " << gettid() << ") bound to "
+            << (thread_id % 2 == 0 ? "even" : "odd") << " CPU cores"
+            << std::endl;
+  return true;
+}
+
 // Default parameters
 constexpr size_t DEFAULT_BUFFER_SIZE = 1 * 1024 * 1024 * 1024UL; // 1GB
 constexpr size_t DEFAULT_BLOCK_SIZE = 4096;                      // 4KB
-constexpr int DEFAULT_DURATION = 60;                             // seconds
-constexpr int DEFAULT_NUM_THREADS = 2;      // total threads
+constexpr int DEFAULT_DURATION = 10;                             // seconds
+constexpr int DEFAULT_NUM_THREADS = 16;      // total threads
 constexpr float DEFAULT_READ_RATIO = 0.5;   // 50% readers, 50% writers
 constexpr size_t DEFAULT_MAX_BANDWIDTH = 0; // 0 means unlimited (MB/s)
 
@@ -200,6 +236,9 @@ void reader_thread(void *buffer, size_t buffer_size, size_t block_size,
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
 
+  // 设置CPU亲和性：偶数ID绑定到偶数核心
+  set_cpu_affinity(thread_id);
+
   // 打印线程ID以便调试
   std::cout << "Reader thread started with ID: " << thread_id
             << " (TID: " << gettid() << ")" << std::endl;
@@ -232,6 +271,9 @@ void writer_thread(void *buffer, size_t buffer_size, size_t block_size,
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
 
+  // 设置CPU亲和性：奇数ID绑定到奇数核心
+  set_cpu_affinity(thread_id);
+
   // 打印线程ID以便调试
   std::cout << "Writer thread started with ID: " << thread_id
             << " (TID: " << gettid() << ")" << std::endl;
@@ -263,6 +305,9 @@ void device_reader_thread(int fd, size_t file_size, size_t block_size,
 
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
+
+  // 设置CPU亲和性：偶数ID绑定到偶数核心
+  set_cpu_affinity(thread_id);
 
   // 打印线程ID以便调试
   std::cout << "Device reader thread started with ID: " << thread_id
@@ -303,6 +348,9 @@ void device_writer_thread(int fd, size_t file_size, size_t block_size,
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
 
+  // 设置CPU亲和性：奇数ID绑定到奇数核心
+  set_cpu_affinity(thread_id);
+
   // 打印线程ID以便调试
   std::cout << "Device writer thread started with ID: " << thread_id
             << " (TID: " << gettid() << ")" << std::endl;
@@ -341,6 +389,9 @@ void mmap_reader_thread(void *mapped_area, size_t file_size, size_t block_size,
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
 
+  // 设置CPU亲和性：偶数ID绑定到偶数核心
+  set_cpu_affinity(thread_id);
+
   // 打印线程ID以便调试
   std::cout << "MMAP reader thread started with ID: " << thread_id
             << " (TID: " << gettid() << ")" << std::endl;
@@ -372,6 +423,9 @@ void mmap_writer_thread(void *mapped_area, size_t file_size, size_t block_size,
 
   // 保存线程ID用于调度和统计
   stats.thread_id = thread_id;
+
+  // 设置CPU亲和性：奇数ID绑定到奇数核心
+  set_cpu_affinity(thread_id);
 
   // 打印线程ID以便调试
   std::cout << "MMAP writer thread started with ID: " << thread_id
@@ -427,6 +481,9 @@ int main(int argc, char *argv[]) {
   std::cout << "Total threads: " << config.num_threads << std::endl;
   std::cout << "Read ratio: " << config.read_ratio << " (" << num_readers
             << " readers, " << num_writers << " writers)" << std::endl;
+  std::cout << "Thread assignment: Even IDs for readers (CPU even cores), Odd "
+               "IDs for writers (CPU odd cores)"
+            << std::endl;
 
   if (config.max_bandwidth_mbps > 0) {
     size_t read_bandwidth =
