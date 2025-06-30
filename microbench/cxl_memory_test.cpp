@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
@@ -16,6 +17,8 @@
 #include <iostream>
 #include <mutex>
 #include <numa.h>
+#include <random>
+#include <string>
 #include <sys/mman.h>
 #include <sys/sysinfo.h>
 #include <thread>
@@ -45,6 +48,11 @@ enum class MemoryMode {
   CXL_MULTI        // Multiple CXL buffers on NUMA node
 };
 
+enum class AccessPattern {
+  SEQUENTIAL,      // Sequential access pattern
+  RANDOM           // Random access pattern
+};
+
 struct TestConfig {
   size_t buffer_size = DEFAULT_BUFFER_SIZE;
   size_t block_size = DEFAULT_BLOCK_SIZE;
@@ -52,6 +60,7 @@ struct TestConfig {
   int num_threads = DEFAULT_NUM_THREADS;
   float read_ratio = DEFAULT_READ_RATIO;
   MemoryMode mode = MemoryMode::SYSTEM_RAM;
+  AccessPattern access_pattern = AccessPattern::SEQUENTIAL;
   uint64_t physical_addr = 0x4080000000ULL; // Default CXL region0 address
   bool use_numa = false;
   int numa_node = -1;
@@ -90,6 +99,7 @@ void print_usage(const char *prog_name) {
          "0,1)\n"
       << "  -p, --cxl-addrs=ADDRS     CXL physical addresses (comma-separated hex, e.g., "
          "0x2080000000,0x2a5c0000000)\n"
+      << "  -x, --access-pattern=PAT  Access pattern: sequential or random (default: sequential)\n"
       << "  -h, --help                Show this help message\n\n"
       << "Examples:\n"
       << "  # System RAM test (CXL memory included in system RAM)\n"
@@ -103,7 +113,11 @@ void print_usage(const char *prog_name) {
       << "  # CXL memory test via NUMA node 2\n"
       << "  " << prog_name << " -m cxl -n 2 -t 16 -r 0.6 -d 60\n\n"
       << "  # Multiple CXL buffers on NUMA node 2 (simulates 2 devices)\n"
-      << "  " << prog_name << " -m multi -n 2 -c 2 -t 16 -r 0.6 -d 60\n";
+      << "  " << prog_name << " -m multi -n 2 -c 2 -t 16 -r 0.6 -d 60\n\n"
+      << "  # Random access pattern test with 32 threads\n"
+      << "  " << prog_name << " -m system -t 32 -x random -r 0.7 -d 30\n\n"
+      << "  # CXL NUMA random access test\n"
+      << "  " << prog_name << " -m cxl -n 2 -t 24 -x random -r 0.5 -d 45\n";
 }
 
 TestConfig parse_args(int argc, char *argv[]) {
@@ -121,11 +135,12 @@ TestConfig parse_args(int argc, char *argv[]) {
       {"interleave", no_argument, 0, 'i'},
       {"cxl-nodes", required_argument, 0, 'c'},
       {"cxl-addrs", required_argument, 0, 'p'},
+      {"access-pattern", required_argument, 0, 'x'},
       {"help", no_argument, 0, 'h'},
       {0, 0, 0, 0}};
 
   int opt, option_index = 0;
-  while ((opt = getopt_long(argc, argv, "b:s:t:d:r:m:a:n:ic:p:h", long_options,
+  while ((opt = getopt_long(argc, argv, "b:s:t:d:r:m:a:n:ic:p:x:h", long_options,
                             &option_index)) != -1) {
     switch (opt) {
     case 'b':
@@ -217,6 +232,16 @@ TestConfig parse_args(int argc, char *argv[]) {
       }
       break;
     }
+    case 'x':
+      if (std::string(optarg) == "sequential") {
+        config.access_pattern = AccessPattern::SEQUENTIAL;
+      } else if (std::string(optarg) == "random") {
+        config.access_pattern = AccessPattern::RANDOM;
+      } else {
+        std::cerr << "Invalid access pattern. Use: sequential or random\n";
+        exit(1);
+      }
+      break;
     case 'h':
       print_usage(argv[0]);
       exit(0);
@@ -231,20 +256,32 @@ TestConfig parse_args(int argc, char *argv[]) {
 
 void system_reader_thread(void *buffer, size_t buffer_size, size_t block_size,
                           std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          int thread_id) {
+                          int thread_id, AccessPattern pattern) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
+  
+  // Random number generator for random access
+  std::random_device rd;
+  std::mt19937 gen(rd() + thread_id); // Seed with thread_id for different sequences
+  std::uniform_int_distribution<size_t> dist(0, (buffer_size - block_size) / block_size);
 
   stats.thread_id = thread_id;
   stats.operation_type = "read";
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
+    // Calculate offset based on access pattern
+    if (pattern == AccessPattern::RANDOM) {
+      offset = dist(gen) * block_size;
+    }
+    
     // Read block from the buffer
     std::memcpy(local_buffer.data(), static_cast<char *>(buffer) + offset,
                 block_size);
 
-    // Move to next block with wrap-around
-    offset = (offset + block_size) % (buffer_size - block_size);
+    // For sequential access, move to next block with wrap-around
+    if (pattern == AccessPattern::SEQUENTIAL) {
+      offset = (offset + block_size) % (buffer_size - block_size);
+    }
 
     // Update statistics
     stats.bytes_processed += block_size;
@@ -254,20 +291,32 @@ void system_reader_thread(void *buffer, size_t buffer_size, size_t block_size,
 
 void system_writer_thread(void *buffer, size_t buffer_size, size_t block_size,
                           std::atomic<bool> &stop_flag, ThreadStats &stats,
-                          int thread_id) {
+                          int thread_id, AccessPattern pattern) {
   std::vector<char> local_buffer(block_size, 'W');
   size_t offset = 0;
+  
+  // Random number generator for random access
+  std::random_device rd;
+  std::mt19937 gen(rd() + thread_id); // Seed with thread_id for different sequences
+  std::uniform_int_distribution<size_t> dist(0, (buffer_size - block_size) / block_size);
 
   stats.thread_id = thread_id;
   stats.operation_type = "write";
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
+    // Calculate offset based on access pattern
+    if (pattern == AccessPattern::RANDOM) {
+      offset = dist(gen) * block_size;
+    }
+    
     // Write block to the buffer
     std::memcpy(static_cast<char *>(buffer) + offset, local_buffer.data(),
                 block_size);
 
-    // Move to next block with wrap-around
-    offset = (offset + block_size) % (buffer_size - block_size);
+    // For sequential access, move to next block with wrap-around
+    if (pattern == AccessPattern::SEQUENTIAL) {
+      offset = (offset + block_size) % (buffer_size - block_size);
+    }
 
     // Update statistics
     stats.bytes_processed += block_size;
@@ -278,15 +327,27 @@ void system_writer_thread(void *buffer, size_t buffer_size, size_t block_size,
 // Interleave memory reader thread
 void interleave_reader_thread(std::vector<void *> &buffers, size_t buffer_size,
                               size_t block_size, std::atomic<bool> &stop_flag,
-                              ThreadStats &stats, int thread_id) {
+                              ThreadStats &stats, int thread_id, AccessPattern pattern) {
   std::vector<char> local_buffer(block_size);
   size_t offset = 0;
   size_t buffer_idx = 0;
+  
+  // Random number generator for random access
+  std::random_device rd;
+  std::mt19937 gen(rd() + thread_id); // Seed with thread_id for different sequences
+  std::uniform_int_distribution<size_t> dist(0, (buffer_size - block_size) / block_size);
+  std::uniform_int_distribution<size_t> buf_dist(0, buffers.size() - 1);
 
   stats.thread_id = thread_id;
   stats.operation_type = "read";
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
+    // Calculate offset and buffer index based on access pattern
+    if (pattern == AccessPattern::RANDOM) {
+      offset = dist(gen) * block_size;
+      buffer_idx = buf_dist(gen);
+    }
+    
     // Interleave between different CXL memory regions
     void *current_buffer = buffers[buffer_idx % buffers.size()];
 
@@ -294,9 +355,11 @@ void interleave_reader_thread(std::vector<void *> &buffers, size_t buffer_size,
     std::memcpy(local_buffer.data(),
                 static_cast<char *>(current_buffer) + offset, block_size);
 
-    // Move to next block and buffer
-    offset = (offset + block_size) % (buffer_size - block_size);
-    buffer_idx++;
+    // For sequential access, move to next block and buffer
+    if (pattern == AccessPattern::SEQUENTIAL) {
+      offset = (offset + block_size) % (buffer_size - block_size);
+      buffer_idx++;
+    }
 
     // Update statistics
     stats.bytes_processed += block_size;
@@ -307,15 +370,27 @@ void interleave_reader_thread(std::vector<void *> &buffers, size_t buffer_size,
 // Interleave memory writer thread
 void interleave_writer_thread(std::vector<void *> &buffers, size_t buffer_size,
                               size_t block_size, std::atomic<bool> &stop_flag,
-                              ThreadStats &stats, int thread_id) {
+                              ThreadStats &stats, int thread_id, AccessPattern pattern) {
   std::vector<char> local_buffer(block_size, 'W');
   size_t offset = 0;
   size_t buffer_idx = 0;
+  
+  // Random number generator for random access
+  std::random_device rd;
+  std::mt19937 gen(rd() + thread_id); // Seed with thread_id for different sequences
+  std::uniform_int_distribution<size_t> dist(0, (buffer_size - block_size) / block_size);
+  std::uniform_int_distribution<size_t> buf_dist(0, buffers.size() - 1);
 
   stats.thread_id = thread_id;
   stats.operation_type = "write";
 
   while (!stop_flag.load(std::memory_order_relaxed)) {
+    // Calculate offset and buffer index based on access pattern
+    if (pattern == AccessPattern::RANDOM) {
+      offset = dist(gen) * block_size;
+      buffer_idx = buf_dist(gen);
+    }
+    
     // Interleave between different CXL memory regions
     void *current_buffer = buffers[buffer_idx % buffers.size()];
 
@@ -323,9 +398,11 @@ void interleave_writer_thread(std::vector<void *> &buffers, size_t buffer_size,
     std::memcpy(static_cast<char *>(current_buffer) + offset,
                 local_buffer.data(), block_size);
 
-    // Move to next block and buffer
-    offset = (offset + block_size) % (buffer_size - block_size);
-    buffer_idx++;
+    // For sequential access, move to next block and buffer
+    if (pattern == AccessPattern::SEQUENTIAL) {
+      offset = (offset + block_size) % (buffer_size - block_size);
+      buffer_idx++;
+    }
 
     // Update statistics
     stats.bytes_processed += block_size;
@@ -379,6 +456,9 @@ int main(int argc, char *argv[]) {
   std::cout << "  Total threads: " << config.num_threads << std::endl;
   std::cout << "  Read ratio: " << config.read_ratio << " (" << num_readers
             << " readers, " << num_writers << " writers)" << std::endl;
+  std::cout << "  Access pattern: " 
+            << (config.access_pattern == AccessPattern::SEQUENTIAL ? "Sequential" : "Random") 
+            << std::endl;
 
   std::string mode_str;
   switch (config.mode) {
@@ -570,11 +650,11 @@ int main(int argc, char *argv[]) {
         threads.emplace_back(interleave_reader_thread,
                              std::ref(interleave_buffers), config.buffer_size,
                              config.block_size, std::ref(stop_flag),
-                             std::ref(thread_stats[i]), i);
+                             std::ref(thread_stats[i]), i, config.access_pattern);
       } else {
         threads.emplace_back(system_reader_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
-                             std::ref(thread_stats[i]), i);
+                             std::ref(thread_stats[i]), i, config.access_pattern);
       }
     }
 
@@ -584,12 +664,13 @@ int main(int argc, char *argv[]) {
         threads.emplace_back(
             interleave_writer_thread, std::ref(interleave_buffers),
             config.buffer_size, config.block_size, std::ref(stop_flag),
-            std::ref(thread_stats[num_readers + i]), num_readers + i);
+            std::ref(thread_stats[num_readers + i]), num_readers + i, 
+            config.access_pattern);
       } else {
         threads.emplace_back(system_writer_thread, buffer, config.buffer_size,
                              config.block_size, std::ref(stop_flag),
                              std::ref(thread_stats[num_readers + i]),
-                             num_readers + i);
+                             num_readers + i, config.access_pattern);
       }
     }
 
