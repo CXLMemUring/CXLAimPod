@@ -186,10 +186,8 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 {
 	struct task_ctx *tctx;
 	struct cpu_ctx *cpu_ctx;
-	struct memory_pattern *pattern;
 	s32 best_cpu = prev_cpu;
 	u32 cpu;
-	u32 pid = p->pid;
 	
 	tctx = bpf_task_storage_get(&task_ctx_stor, p, 0, 0);
 	if (!tctx)
@@ -242,15 +240,36 @@ s32 BPF_STRUCT_OPS(cxl_select_cpu, struct task_struct *p, s32 prev_cpu, u64 wake
 		}
 		
 		// 如果无法分配到理想CPU，使用负载最轻的对应奇偶性CPU
-		for (cpu = 0; cpu < 4 && cpu < nr_cpus; cpu++) {
-			// 只考虑与线程ID奇偶性匹配的CPU
-			if ((cpu % 2) != (is_even_thread ? 0 : 1))
-			continue;
-			
-			if (bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+		// 使用更简单的方式避免verifier检测到的无限循环
+		if (is_even_thread) {
+			// 偶数线程尝试偶数CPU
+			cpu = 0;
+			if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
 				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
 				if (cpu_ctx) {
-					// 即使CPU不空闲，也可以分配
+					return cpu;
+				}
+			}
+			cpu = 2;
+			if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
+				if (cpu_ctx) {
+					return cpu;
+				}
+			}
+		} else {
+			// 奇数线程尝试奇数CPU
+			cpu = 1;
+			if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
+				if (cpu_ctx) {
+					return cpu;
+				}
+			}
+			cpu = 3;
+			if (cpu < nr_cpus && bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+				cpu_ctx = bpf_map_lookup_elem(&cpu_contexts, &cpu);
+				if (cpu_ctx) {
 					return cpu;
 				}
 			}
