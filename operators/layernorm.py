@@ -30,10 +30,16 @@ from ktransformers.models.modeling_qwen2_moe import Qwen2MoeRMSNorm
 from ktransformers.models.modeling_qwen3_moe import Qwen3MoeRMSNorm
 from ktransformers.operators.base_operator import BaseInjectedModule
 from ktransformers.util.custom_gguf import GGUFLoader
-from flashinfer.norm import (
-    fused_add_rmsnorm,
-    rmsnorm,
-)
+fused_add_rmsnorm = None
+rmsnorm = None
+if torch.cuda.is_available():
+    try:
+        from flashinfer.norm import (
+            fused_add_rmsnorm,
+            rmsnorm,
+        )
+    except ImportError:
+        pass
 
 
 logger = logging.getLogger(__name__)

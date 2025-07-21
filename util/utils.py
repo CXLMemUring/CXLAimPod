@@ -109,7 +109,8 @@ def load_cur_state_dict(module: nn.Module, gguf_loader: GGUFLoader, prefix: str 
             target_dtype = torch.get_default_dtype()
             device = "cpu"  # Force CPU loading
             print(f"loading {translated_key} to {device}")
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             weights = load_dequantized_tensor(translated_key, device=device).to(dtype=target_dtype)
             set_param(module, name, weights)
             del weights
@@ -216,10 +217,10 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             
             # Default to float32 if we couldn't determine the model dtype
             if model_dtype is None:
-                model_dtype = torch.float32
+                model_dtype = torch.int8
             
             # On CPU, we'll use float32 for stability regardless of model's native dtype
-            compute_dtype = torch.float32
+            compute_dtype = torch.int8
             
             # Ensure inputs are on CPU with consistent dtypes and shapes
             # Make sure cur_token is 2D with shape [batch_size, seq_len]
@@ -266,7 +267,13 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     logits = outputs[0].to(dtype=compute_dtype)
                 
                 # Calculate next token
-                next_token_logits = logits[:, -1, :]
+                # Handle different logits dimensions
+                if logits.dim() == 3:
+                    next_token_logits = logits[:, -1, :]
+                elif logits.dim() == 2:
+                    next_token_logits = logits
+                else:
+                    next_token_logits = logits.view(-1, logits.shape[-1])
                 next_token_scores = logits_warper(cur_token, next_token_logits)
                 
                 # Either sample or take argmax
@@ -307,7 +314,13 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     else:
                         logits = outputs[0].to(dtype=compute_dtype)
                     
-                    next_token_logits = logits[:, -1, :]
+                    # Handle different logits dimensions
+                    if logits.dim() == 3:
+                        next_token_logits = logits[:, -1, :]
+                    elif logits.dim() == 2:
+                        next_token_logits = logits
+                    else:
+                        next_token_logits = logits.view(-1, logits.shape[-1])
                     next_token_scores = logits_warper(cur_token, next_token_logits)
                     next_token = torch.argmax(next_token_scores, dim=-1)
                     return next_token
@@ -347,7 +360,13 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                         else:
                             logits = outputs[0].to(dtype=compute_dtype)
                         
-                        next_token_logits = logits[:, -1, :]
+                        # Handle different logits dimensions
+                        if logits.dim() == 3:
+                            next_token_logits = logits[:, -1, :]
+                        elif logits.dim() == 2:
+                            next_token_logits = logits
+                        else:
+                            next_token_logits = logits.view(-1, logits.shape[-1])
                         next_token_scores = logits_warper(cur_token, next_token_logits)
                         next_token = torch.argmax(next_token_scores, dim=-1)
                         return next_token
@@ -458,7 +477,13 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                 
                 # Safely get the last token logits
                 if logits.dim() >= 2:
-                    last_logits = logits[:, -1, :].clone()
+                    # Handle different logits dimensions
+                    if logits.dim() == 3:
+                        last_logits = logits[:, -1, :].clone()
+                    elif logits.dim() == 2:
+                        last_logits = logits.clone()
+                    else:
+                        last_logits = logits.view(-1, logits.shape[-1]).clone()
                     if last_logits.dim() == 2:
                         return last_logits.unsqueeze(0)
                     return last_logits
@@ -492,7 +517,19 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     
                     # Extract logits and ensure they have consistent dtype
                     logits = outputs.logits.to(dtype=torch.float32)
-                    return logits[:, -1, :]
+                    # Handle different logits dimensions
+                    if logits.dim() == 3:
+                        # Handle different logits dimensions
+                        if logits.dim() == 3:
+                            return logits[:, -1, :]
+                        elif logits.dim() == 2:
+                            return logits
+                        else:
+                            return logits.view(-1, logits.shape[-1])
+                    elif logits.dim() == 2:
+                        return logits
+                    else:
+                        return logits.view(-1, logits.shape[-1])
                 
                 elif "expected m1 and m2 to have the same dtype" in str(e):
                     # Handle dtype mismatch
@@ -510,7 +547,19 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     )
                     
                     logits = outputs.logits.to(dtype=torch.float32)
-                    return logits[:, -1, :]
+                    # Handle different logits dimensions
+                    if logits.dim() == 3:
+                        # Handle different logits dimensions
+                        if logits.dim() == 3:
+                            return logits[:, -1, :]
+                        elif logits.dim() == 2:
+                            return logits
+                        else:
+                            return logits.view(-1, logits.shape[-1])
+                    elif logits.dim() == 2:
+                        return logits
+                    else:
+                        return logits.view(-1, logits.shape[-1])
                 
                 else:
                     # Fallback implementation - manual call each component
@@ -525,7 +574,19 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     # Apply the language model head
                     if hasattr(model, 'lm_head'):
                         logits = model.lm_head(hidden_states)
-                        return logits[:, -1, :]
+                        # Handle different logits dimensions
+                    if logits.dim() == 3:
+                        # Handle different logits dimensions
+                        if logits.dim() == 3:
+                            return logits[:, -1, :]
+                        elif logits.dim() == 2:
+                            return logits
+                        else:
+                            return logits.view(-1, logits.shape[-1])
+                    elif logits.dim() == 2:
+                        return logits
+                    else:
+                        return logits.view(-1, logits.shape[-1])
                 
                 # If we can't get logits, return a tensor of zeros as a last resort
                 print("Couldn't produce valid logits. Returning zeros.")
@@ -608,14 +669,27 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             # change this to modify generate config
             #top_k=5, top_p=0.85, temperature=0.1
         )
-        try: # transformers==4.43
-            logits_warper = (
-                model._get_logits_warper(generation_config,device=inputs.device)
-            )
-        except: 
-            logits_warper = (
-                model._get_logits_warper(generation_config)
-            )
+        # Create LogitsProcessorList directly for compatibility
+        from transformers.generation.logits_process import (
+            LogitsProcessorList,
+            TemperatureLogitsWarper,
+            TopPLogitsWarper,
+            TopKLogitsWarper,
+        )
+        
+        logits_warper = LogitsProcessorList()
+        
+        # Add temperature warper if applicable
+        if hasattr(generation_config, 'temperature') and generation_config.temperature is not None and generation_config.temperature != 1.0:
+            logits_warper.append(TemperatureLogitsWarper(generation_config.temperature))
+        
+        # Add top-k warper if applicable
+        if hasattr(generation_config, 'top_k') and generation_config.top_k is not None and generation_config.top_k > 0:
+            logits_warper.append(TopKLogitsWarper(top_k=generation_config.top_k))
+        
+        # Add top-p warper if applicable
+        if hasattr(generation_config, 'top_p') and generation_config.top_p is not None and generation_config.top_p < 1.0:
+            logits_warper.append(TopPLogitsWarper(top_p=generation_config.top_p))
 
         cache_position = torch.arange(seq_length, device=torch_device, dtype=torch.int32)
         generated_ids = torch.zeros(
@@ -632,7 +706,14 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             logits = chunk_prefill(inputs[:, chunk_start:chunk_end], cache_position[chunk_start:chunk_end], past_key_values)
             chunk_start += chunk_size
 
-        next_token_scores = logits_warper(inputs, logits[:, -1, :])
+        # Handle different logits dimensions
+        if logits.dim() == 3:
+            next_token_scores = logits_warper(inputs, logits[:, -1, :])
+        elif logits.dim() == 2:
+            next_token_scores = logits_warper(inputs, logits)
+        else:
+            # Fallback for unexpected dimensions
+            next_token_scores = logits_warper(inputs, logits.view(-1, logits.shape[-1]))
         if generation_config.do_sample:
             probs = nn.functional.softmax(next_token_scores, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).squeeze(1)

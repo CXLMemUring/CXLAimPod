@@ -143,12 +143,12 @@ class StaticCache(transformers.StaticCache):
             page_idx = cache_position // self.page_size
             page_offset = cache_position % self.page_size
             # key shape (self.max_pages, self.page_size, 1, config.kv_lora_rank + config.qk_rope_head_dim)
-            k_out[page_idx, page_offset, :, :self.kv_lora_rank] = key_states
-            k_out[page_idx, page_offset, :, self.kv_lora_rank:] = value_states
+            k_out[page_idx, page_offset, :, :self.kv_lora_rank] = key_states.to(k_out.dtype)
+            k_out[page_idx, page_offset, :, self.kv_lora_rank:] = value_states.to(k_out.dtype)
             return k_out, self.page_table_list[layer_idx]
         else:
-            k_out[:, :, cache_position] = key_states
-            v_out[:, :, cache_position] = value_states
+            k_out[:, :, cache_position] = key_states.to(k_out.dtype)
+            v_out[:, :, cache_position] = value_states.to(v_out.dtype)
             return k_out, v_out
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:

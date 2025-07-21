@@ -313,11 +313,11 @@ class KQwen2MoeModel(BaseInjectedModule):
 
         for i, decoder_layer in enumerate(self.layers):
             if self.transfer_map is not None and i in self.transfer_map:
-                prev_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
                 cur_device = self.transfer_map[i]
-                if cur_device not in self.stream_device_map and cur_device.lower() != "cpu" and torch.cuda.is_available():
-                    self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
-                if cur_device.lower() != "cpu" and torch.cuda.is_available():
+                if torch.cuda.is_available() and cur_device.lower() != "cpu":
+                    prev_stream = torch.cuda.current_stream()
+                    if cur_device not in self.stream_device_map:
+                        self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
                     torch.cuda.set_device(cur_device)
                     self.stream_device_map[cur_device].wait_stream(prev_stream)
                     torch.cuda.set_stream(self.stream_device_map[cur_device])
@@ -363,7 +363,8 @@ class KQwen2MoeModel(BaseInjectedModule):
                     try:
                         if torch.cuda.is_available():
                             self.load_layer_to(decoder_layer, InferenceState.PREFILL)
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                         else:
                             # 如果没有CUDA，仍保持在CPU上
                             pass
@@ -391,7 +392,8 @@ class KQwen2MoeModel(BaseInjectedModule):
                     try:
                         self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
                         if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     except Exception as e:
                         print(f"无法卸载层: {e}")
             hidden_states = layer_outputs[0]
@@ -602,7 +604,8 @@ class KDeepseekV2Model(BaseInjectedModule):
             per_layer_prefill_flag = True
             for layer in self.layers:
                 self.load_layer_to(layer, InferenceState.UNLOAD)
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             pass
         output_attentions = (
@@ -692,11 +695,11 @@ class KDeepseekV2Model(BaseInjectedModule):
 
         for i, decoder_layer in enumerate(self.layers):
             if self.transfer_map is not None and i in self.transfer_map:
-                prev_stream = torch.cuda.current_stream() if torch.cuda.is_available() else None
                 cur_device = self.transfer_map[i]
-                if cur_device not in self.stream_device_map and cur_device.lower() != "cpu" and torch.cuda.is_available():
-                    self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
-                if cur_device.lower() != "cpu" and torch.cuda.is_available():
+                if torch.cuda.is_available() and cur_device.lower() != "cpu":
+                    prev_stream = torch.cuda.current_stream()
+                    if cur_device not in self.stream_device_map:
+                        self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
                     torch.cuda.set_device(cur_device)
                     self.stream_device_map[cur_device].wait_stream(prev_stream)
                     torch.cuda.set_stream(self.stream_device_map[cur_device])
@@ -742,7 +745,8 @@ class KDeepseekV2Model(BaseInjectedModule):
                     try:
                         if torch.cuda.is_available():
                             self.load_layer_to(decoder_layer, InferenceState.PREFILL)
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                         else:
                             # 如果没有CUDA，仍保持在CPU上
                             pass
@@ -766,7 +770,8 @@ class KDeepseekV2Model(BaseInjectedModule):
                     try:
                         self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
                         if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                     except Exception as e:
                         print(f"无法卸载层: {e}")
                 t6 = time.time()
@@ -795,7 +800,8 @@ class KDeepseekV2Model(BaseInjectedModule):
             per_layer_prefill_flag = False
             for layer in self.layers:
                 self.load_layer_to(layer, InferenceState.GENERATE)
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             t7 = time.time()
 
             print(

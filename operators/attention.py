@@ -31,7 +31,7 @@ from ktransformers.operators.triton_attention import decode_attention_fwd_groupe
 from ktransformers.operators.triton_attention_prefill import context_attention_fwd
 import os
 from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
-if flashinfer_enabled:
+if flashinfer_enabled and torch.cuda.is_available():
     from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from ktransformers.models.custom_cache import KDeepSeekV3Cache
@@ -140,7 +140,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         compressed_kv = compressed_kv.view(bsz, 1, -1, self.kv_lora_rank)[:,:,:attention_mask.size(-1),:]
         # k_pe [bsz, 1, cache_len, self.qk_rope_head_dim]
         # compressed_kv [bsz, 1, cache_len,self.kv_lora_rank]
-        q_nope = torch.matmul(q_nope, q_absorb)
+        q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype))
         
         # Add safety checks for tensor shapes
         try:
@@ -171,7 +171,9 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                                           -10000.0, device=attention_mask.device, dtype=attention_mask.dtype)
                     attention_mask = torch.cat([attention_mask, padding], dim=-1)
             
-            attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.mT)) * self.softmax_scale
+            # Ensure all tensors have the same dtype
+            q_pe_dtype = q_pe.dtype
+            attn_weights = (torch.matmul(q_pe, k_pe.mT.to(q_pe_dtype)) + torch.matmul(q_nope.to(q_pe_dtype), compressed_kv.mT.to(q_pe_dtype))) * self.softmax_scale
         except RuntimeError as e:
             print(f"Error in attention calculation: {e}")
             print(f"q_pe shape: {q_pe.shape}, k_pe shape: {k_pe.shape}")
@@ -182,13 +184,18 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             
             # Reshape all tensors to ensure compatibility
             reshaped_q_pe = q_pe.reshape(bsz * num_heads, q_len, -1)
-            reshaped_k_pe = k_pe.reshape(bsz * 1, kv_seq_len, -1)
             reshaped_q_nope = q_nope.reshape(bsz * num_heads, q_len, -1)
-            reshaped_compressed_kv = compressed_kv.reshape(bsz * 1, kv_seq_len, -1)
             
-            # Compute attention weights with reshaped tensors
-            pe_weights = torch.bmm(reshaped_q_pe, reshaped_k_pe.transpose(1, 2))
-            nope_weights = torch.bmm(reshaped_q_nope, reshaped_compressed_kv.transpose(1, 2))
+            # Expand k_pe and compressed_kv to match the number of heads
+            expanded_k_pe = k_pe.expand(bsz, num_heads, kv_seq_len, -1)
+            expanded_compressed_kv = compressed_kv.expand(bsz, num_heads, kv_seq_len, -1)
+            
+            reshaped_k_pe = expanded_k_pe.reshape(bsz * num_heads, kv_seq_len, -1)
+            reshaped_compressed_kv = expanded_compressed_kv.reshape(bsz * num_heads, kv_seq_len, -1)
+            
+            # Compute attention weights with reshaped tensors (ensure same dtype)
+            pe_weights = torch.bmm(reshaped_q_pe, reshaped_k_pe.transpose(1, 2).to(reshaped_q_pe.dtype))
+            nope_weights = torch.bmm(reshaped_q_nope, reshaped_compressed_kv.transpose(1, 2).to(reshaped_q_nope.dtype))
             
             # Reshape back
             pe_weights = pe_weights.reshape(bsz, num_heads, q_len, kv_seq_len)
@@ -214,7 +221,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 )
             """
             #causal_mask = attention_mask[:, :, :, : kv_seq_len]
-            attn_weights = attn_weights + attention_mask
+            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
@@ -224,9 +231,9 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             attn_weights, p=self.attention_dropout, training=self.training
         )
         
-        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
+        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv.to(attn_weights.dtype))
         
-        attn_output = torch.matmul(attn_output, out_absorb.mT) 
+        attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype)) 
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
@@ -300,7 +307,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
             q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+            q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype)) # batched MM
             q_nope = q_nope.transpose(1, 2)
             #assert q_nope.is_contiguous()
             
@@ -341,7 +348,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
             attn_output = attn_output.transpose(1, 2)
-            attn_output = torch.matmul(attn_output, out_absorb.mT)
+            attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype))
             attn_output = attn_output.transpose(1, 2)
             
             attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
@@ -454,7 +461,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
             q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
+            q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype)) # batched MM
             q_nope = q_nope.transpose(1, 2)
             q_nope = q_nope.contiguous()
             #assert q_nope.is_contiguous()
@@ -518,7 +525,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
             attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
-            attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
+            attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype)) # [bsz, self.num_heads, q_len, self.v_head_dim]
             attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
             
             attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
@@ -657,7 +664,8 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 input_tensor = input_tensor.to(dtype=weight_tensor.dtype)
             return input_tensor
 
-        if os.name == 'nt' or get_compute_capability()<8 or device_manager.gpu_vendor != GPUVendor.NVIDIA:
+        compute_capability = get_compute_capability()
+        if os.name == 'nt' or compute_capability is None or compute_capability < 8 or device_manager.gpu_vendor != GPUVendor.NVIDIA:
             return self.forward_windows(
                 hidden_states,
                 attention_mask,
@@ -913,7 +921,7 @@ class KLlamaAttention(BaseInjectedModule):
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
             if attention_mask is not None:
                 # Apply attention mask
-                attn_weights = attn_weights + attention_mask
+                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
             
             # Apply softmax
             attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)

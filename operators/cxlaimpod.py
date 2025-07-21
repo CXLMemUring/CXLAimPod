@@ -1,10 +1,18 @@
 # Add this to your custom_moe.py file
+import torch
 from ktransformers.operators.experts import KTransformersExperts, KExpertsCPU
-from ktransformers.util import InferenceState
+from ktransformers.util.utils import InferenceState
 # Create this in a new file, e.g., custom_attention.py
-from ktransformers.operators.attention import KDeepseekV2Attention
+try:
+    from ktransformers.operators.attention import KDeepseekV2Attention
+except ImportError:
+    # Fallback to base attention if specific version not available
+    from ktransformers.operators.base_operator import BaseInjectedModule
+    from ktransformers.models.modeling_deepseek_v3 import DeepseekV3Attention
+    class KDeepseekV2Attention(BaseInjectedModule, DeepseekV3Attention):
+        pass
 from ktransformers.operators.dynamic_attention import DynamicScaledDotProductAttention
-from ktransformers.util import InferenceState
+from ktransformers.util.utils import InferenceState
 
 class KCustomAttention(KDeepseekV2Attention):
     def __init__(self, *args, **kwargs):
@@ -13,7 +21,7 @@ class KCustomAttention(KDeepseekV2Attention):
             max_seq_len=kwargs.get('max_seq_len', 32768),
             block_size=kwargs.get('block_size', 128),
             config=self.config,
-            device='cpu',
+            device=torch.device('cpu'),
             local_windows_len=kwargs.get('local_windows_len', 1024),
             topk=kwargs.get('topk', 16),
             threads_num=kwargs.get('threads_num', 8),

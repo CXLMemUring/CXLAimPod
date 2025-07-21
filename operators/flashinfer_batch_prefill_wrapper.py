@@ -1,6 +1,12 @@
 import torch
-import flashinfer
 import gc
+
+flashinfer = None
+if torch.cuda.is_available():
+    try:
+        import flashinfer
+    except ImportError:
+        pass
 try:
     from flash_attn import flash_attn_with_kvcache
     print("found flash_attn")
@@ -12,7 +18,8 @@ from typing import Union, Optional
 
 def setup_seed(seed):
 	torch.manual_seed(seed)
-	torch.cuda.manual_seed_all(seed)
+	if torch.cuda.is_available():
+		torch.cuda.manual_seed_all(seed)
 
 setup_seed(998244353)
 
@@ -20,9 +27,10 @@ torch.set_grad_enabled(False)
 torch.set_default_dtype(torch.bfloat16)
 global_dtype=torch.bfloat16
 global_device=torch.device("cpu",0)
-torch.cuda.set_device(0)
-torch.backends.cudnn.enabled =True
-torch.backends.cudnn.benchmark = True
+if torch.cuda.is_available():
+	torch.cuda.set_device(0)
+	torch.backends.cudnn.enabled =True
+	torch.backends.cudnn.benchmark = True
 
 class flashInferAttn():
 	

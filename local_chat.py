@@ -161,13 +161,10 @@ def local_chat(
     if mode == 'long_context':
         assert Config().long_context_config['max_seq_len'] > input_tensor.shape[1] + max_new_tokens, \
         "please change max_seq_len in  ~/.ktransformers/config.yaml"
-    torch.set_default_dtype(
-        torch.bfloat16
-    )  # TODO: Remove this, replace dtype using config
     generated = prefill_and_generate(
         model, tokenizer, input_tensor, max_new_tokens, use_cuda_graph, mode
     )
-        #return
+    return generated
 
 
 if __name__ == "__main__":

@@ -167,6 +167,7 @@ class KExpertsCPU(KExpertsBase):
         self.gate_type = w["gate_type"]
         self.up_type = w["up_type"]
         self.down_type = w["down_type"]
+        self.cpu_infer = KExpertsCPU.CPU_INFER
         
         
         gate_ptr = ctypes.addressof(
@@ -286,10 +287,15 @@ class KExpertsCPU(KExpertsBase):
             self.cpu_infer.submit(self.moe.warm_up())
             self.cpu_infer.sync()
         if self.out_device not in KExpertsCPU.output_gpu_map:
-            if isinstance(cuda_graphs, list):
-                KExpertsCPU.output_gpu_map[self.out_device] = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device=self.out_device) for i in range(len(cuda_graphs))]
+            # Only create GPU buffers if out_device is a CUDA device and CUDA is available
+            if self.out_device.startswith("cuda") and torch.cuda.is_available():
+                if isinstance(cuda_graphs, list):
+                    KExpertsCPU.output_gpu_map[self.out_device] = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device=self.out_device) for i in range(len(cuda_graphs))]
+                else:
+                    KExpertsCPU.output_gpu_map[self.out_device] = torch.zeros((cuda_graphs, self.config.hidden_size), device=self.out_device)
             else:
-                KExpertsCPU.output_gpu_map[self.out_device] = torch.zeros((cuda_graphs, self.config.hidden_size), device=self.out_device)
+                # For CPU mode, we'll use the CPU output buffers directly
+                KExpertsCPU.output_gpu_map[self.out_device] = None
         if KExpertsCPU.input_tensor_cpu == None:
             if isinstance(cuda_graphs, list):
                 KExpertsCPU.input_tensor_cpu = [torch.zeros((cuda_graphs[i], self.config.hidden_size), device="cpu", pin_memory=_use_pin_memory) for i in range(len(cuda_graphs))]
@@ -312,41 +318,41 @@ class KExpertsCPU(KExpertsBase):
             KExpertsCPU.expert_ids_cpu[cuda_graph_idx].copy_(expert_ids, non_blocking=True)
             KExpertsCPU.weights_cpu[cuda_graph_idx].copy_(weights, non_blocking=True)
             KExpertsCPU.bsz_tensor_cpu[cuda_graph_idx].copy_(bsz_tensor, non_blocking=True)
-            self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream, self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.weights_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.input_tensor_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.output_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.bsz_tensor_cpu[cuda_graph_idx].data_ptr()))
+            if self.out_device.startswith("cuda") and torch.cuda.is_available():
+                self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream().cuda_stream, self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.weights_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.input_tensor_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.output_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.bsz_tensor_cpu[cuda_graph_idx].data_ptr()))
+            else:
+                self.cpu_infer.submit(self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.weights_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.input_tensor_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.output_cpu[cuda_graph_idx].data_ptr(), KExpertsCPU.bsz_tensor_cpu[cuda_graph_idx].data_ptr()))
         else:
             KExpertsCPU.input_tensor_cpu.copy_(input_tensor, non_blocking=True)
             KExpertsCPU.expert_ids_cpu.copy_(expert_ids, non_blocking=True)
             KExpertsCPU.weights_cpu.copy_(weights, non_blocking=True)
             KExpertsCPU.bsz_tensor_cpu.copy_(bsz_tensor, non_blocking=True)
-            self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream, self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu.data_ptr(), KExpertsCPU.weights_cpu.data_ptr(), KExpertsCPU.input_tensor_cpu.data_ptr(), KExpertsCPU.output_cpu.data_ptr(), KExpertsCPU.bsz_tensor_cpu.data_ptr()))
+            if self.out_device.startswith("cuda") and torch.cuda.is_available():
+                self.cpu_infer.submit_with_cuda_stream(torch.cuda.current_stream().cuda_stream, self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu.data_ptr(), KExpertsCPU.weights_cpu.data_ptr(), KExpertsCPU.input_tensor_cpu.data_ptr(), KExpertsCPU.output_cpu.data_ptr(), KExpertsCPU.bsz_tensor_cpu.data_ptr()))
+            else:
+                self.cpu_infer.submit(self.moe.forward(1, expert_ids.size(-1), KExpertsCPU.expert_ids_cpu.data_ptr(), KExpertsCPU.weights_cpu.data_ptr(), KExpertsCPU.input_tensor_cpu.data_ptr(), KExpertsCPU.output_cpu.data_ptr(), KExpertsCPU.bsz_tensor_cpu.data_ptr()))
         
 
     def sync_for_one_decode(self, cuda_graph_idx=0):
-        if cuda_graph_idx != -1:
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream)
-            KExpertsCPU.output_gpu_map[self.out_device][cuda_graph_idx].copy_(KExpertsCPU.output_cpu[cuda_graph_idx], non_blocking=True)
-            return KExpertsCPU.output_gpu_map[self.out_device][cuda_graph_idx]
+        if self.out_device.startswith("cuda") and torch.cuda.is_available():
+            if cuda_graph_idx != -1:
+                self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
+                KExpertsCPU.output_gpu_map[self.out_device][cuda_graph_idx].copy_(KExpertsCPU.output_cpu[cuda_graph_idx], non_blocking=True)
+                return KExpertsCPU.output_gpu_map[self.out_device][cuda_graph_idx]
+            else:
+                self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
+                KExpertsCPU.output_gpu_map[self.out_device].copy_(KExpertsCPU.output_cpu, non_blocking=True)
+                return KExpertsCPU.output_gpu_map[self.out_device]
         else:
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream(self.out_device).cuda_stream)
-            KExpertsCPU.output_gpu_map[self.out_device].copy_(KExpertsCPU.output_cpu, non_blocking=True)
-            return KExpertsCPU.output_gpu_map[self.out_device]
+            self.cpu_infer.sync()
+            if cuda_graph_idx != -1:
+                return KExpertsCPU.output_cpu[cuda_graph_idx].to(self.out_device)
+            else:
+                return KExpertsCPU.output_cpu.to(self.out_device)
 
     def forward(self, input_tensor, expert_ids, weights, bsz_tensor=None, cuda_graph_idx=0):
         # For AMXDynamicInt8 backend, convert tensors before forwarding
         if self.backend == "AMXDynamicInt8" and hasattr(self, 'needs_dynamic_conversion') and self.needs_dynamic_conversion:
-            from ktransformers.util.custom_gguf import GGMLQuantizationType, convert_to_i8
-            print("Performing dynamic conversion from original format to int8")
-            
-            # Convert tensors to I8 format dynamically
-            if self.original_gate_type != GGMLQuantizationType.I8:
-                self.gate = convert_to_i8(self.gate)
-            
-            if self.original_up_type != GGMLQuantizationType.I8:
-                self.up = convert_to_i8(self.up)
-            
-            if self.original_down_type != GGMLQuantizationType.I8:
-                self.down = convert_to_i8(self.down)
-                
             # Update pointers for the MOE module
             gate_ptr = ctypes.addressof(
                 ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
@@ -381,7 +387,7 @@ class KExpertsCPU(KExpertsBase):
         # print(expert_ids)
         if bsz_tensor is None:
             bsz_tensor = torch.tensor([input_tensor.size(0)], device=input_tensor.device, dtype=torch.int32)
-        if torch.cuda.is_current_stream_capturing():
+        if torch.cuda.is_available() and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             if cuda_graph_idx != -1:
                 KExpertsCPU.input_tensor_cpu[cuda_graph_idx].copy_(input_tensor, non_blocking=True)
                 KExpertsCPU.expert_ids_cpu[cuda_graph_idx].copy_(expert_ids, non_blocking=True)
@@ -911,7 +917,7 @@ class KDeepseekV2MoE(BaseInjectedModule, DeepseekV2MoE):
         topk_idx, topk_weight, aux_loss = self.gate(hidden_states)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         
-        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing():
+        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             self.experts.generate_experts.submit_for_one_decode(hidden_states[0], topk_idx[0], topk_weight[0])
             if self.config.n_shared_experts is not None:
                 y_ = self.shared_experts(identity).squeeze(0)
@@ -1011,7 +1017,7 @@ class KDeepseekV3MoE(BaseInjectedModule, DeepseekV3MoE):
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         
         # only for generate phase
-        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing():
+        if sequence_length == 1 and hasattr(self.experts.generate_experts, "submit_for_one_decode") and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()):
             self.experts.generate_experts.submit_for_one_decode(hidden_states[0], topk_idx[0], topk_weight[0])
             if self.config.n_shared_experts is not None:
                 y_ = self.shared_experts(identity).squeeze(0)
@@ -1211,7 +1217,7 @@ class KDeepseekV3MoEV2(BaseInjectedModule, DeepseekV3MoE):
         
 
         # only for generate phase
-        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing(): # TODO: this branch cause jit bug
+        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()): # TODO: this branch cause jit bug
             self.experts.generate_experts.submit_for_one_decode(hidden_states, topk_idx, topk_weight, bsz_tensor, cuda_graph_idx)
             if self.config.n_shared_experts is not None:
                 y_ = self.shared_experts(identity, bsz_tensor).squeeze(0)
@@ -1393,7 +1399,7 @@ class KQwen2MoeSparseMoeBlockV2(BaseInjectedModule, Qwen2MoeSparseMoeBlock):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         # only for generate phase
-        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing(): # TODO: this branch cause jit bug
+        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()): # TODO: this branch cause jit bug
             self.experts.generate_experts.submit_for_one_decode(hidden_states, selected_experts, routing_weights, bsz_tensor, cuda_graph_idx)
             y_ = self.shared_expert(hidden_states, bsz_tensor).squeeze(0)
             y_ = F.sigmoid(self.shared_expert_gate(hidden_states)) * y_    
@@ -1506,7 +1512,7 @@ class KQwen3MoeSparseMoeBlockV2(BaseInjectedModule, Qwen3MoeSparseMoeBlock):
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         # only for generate phase
-        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and torch.cuda.is_current_stream_capturing(): # TODO: this branch cause jit bug
+        if hasattr(self.experts.generate_experts, "submit_for_one_decode") and (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()): # TODO: this branch cause jit bug
             self.experts.generate_experts.submit_for_one_decode(hidden_states, selected_experts, routing_weights, bsz_tensor, cuda_graph_idx)
             # y_ = self.shared_expert(hidden_states, bsz_tensor).squeeze(0)
             # y_ = F.sigmoid(self.shared_expert_gate(hidden_states)) * y_    
