@@ -44,7 +44,7 @@ long_context:
   local_windows_len: 4096
   second_select_num: 32
   anchor_type: DYNAMIC
-  kv_type: FP16
+  kv_type: Q8_0
   dense_layer_num: 2
   anchor_num: 1
   preselect_block: True

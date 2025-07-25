@@ -43,7 +43,7 @@ class DynamicScaledDotProductAttention:
         topk: int,
         threads_num: int,
         anchor_type: str = "DYNAMIC",
-        kv_type: str = "FP16",
+        kv_type: str = "Q8_0",
         dense_layer_num: int = 0,
         anchor_num: int = 1,
         block_selection_mode: str = "SHARED",

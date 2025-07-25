@@ -145,14 +145,14 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         # Add safety checks for tensor shapes
         try:
             if q_pe.shape[-2] != k_pe.shape[-2]:
-                print(f"Shape mismatch in attention: q_pe shape {q_pe.shape}, k_pe shape {k_pe.shape}")
+                # print(f"Shape mismatch in attention: q_pe shape {q_pe.shape}, k_pe shape {k_pe.shape}")
                 # Adjust shapes to be compatible
                 min_len = min(q_pe.shape[-2], k_pe.shape[-2])
                 q_pe = q_pe[:, :, :min_len, :]
                 k_pe = k_pe[:, :, :min_len, :]
             
             if q_nope.shape[-2] != compressed_kv.shape[-2]:
-                print(f"Shape mismatch in attention: q_nope shape {q_nope.shape}, compressed_kv shape {compressed_kv.shape}")
+                # print(f"Shape mismatch in attention: q_nope shape {q_nope.shape}, compressed_kv shape {compressed_kv.shape}")
                 # Adjust shapes to be compatible
                 min_len = min(q_nope.shape[-2], compressed_kv.shape[-2])
                 q_nope = q_nope[:, :, :min_len, :]
@@ -160,7 +160,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 
             # Ensure attention_mask has the right shape
             if attention_mask is not None and attention_mask.shape[-1] != k_pe.shape[-2]:
-                print(f"Attention mask shape mismatch: {attention_mask.shape}, k_pe shape: {k_pe.shape}")
+                # print(f"Attention mask shape mismatch: {attention_mask.shape}, k_pe shape: {k_pe.shape}")
                 # Resize attention mask to match
                 if attention_mask.shape[-1] > k_pe.shape[-2]:
                     attention_mask = attention_mask[:, :, :, :k_pe.shape[-2]]

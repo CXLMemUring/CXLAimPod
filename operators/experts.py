@@ -351,38 +351,6 @@ class KExpertsCPU(KExpertsBase):
                 return KExpertsCPU.output_cpu.to(self.out_device)
 
     def forward(self, input_tensor, expert_ids, weights, bsz_tensor=None, cuda_graph_idx=0):
-        # For AMXDynamicInt8 backend, convert tensors before forwarding
-        if self.backend == "AMXDynamicInt8" and hasattr(self, 'needs_dynamic_conversion') and self.needs_dynamic_conversion:
-            # Update pointers for the MOE module
-            gate_ptr = ctypes.addressof(
-                ctypes.cast(self.gate.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-            )
-            up_ptr = ctypes.addressof(
-                ctypes.cast(self.up.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-            )
-            down_ptr = ctypes.addressof(
-                ctypes.cast(self.down.ctypes.data, ctypes.POINTER(ctypes.c_uint64)).contents
-            )
-            
-            # Reload MOE with converted tensors
-            from cpuinfer_ext.moe import AMX_MOEConfig, AMXInt8_MOE
-            moe_config = AMX_MOEConfig(
-                self.n_routed_experts,
-                self.config.num_experts_per_tok,
-                self.config.hidden_size,
-                self.config.moe_intermediate_size,
-                25600,
-                gate_ptr,
-                up_ptr,
-                down_ptr,
-            )
-            self.moe = AMXInt8_MOE(moe_config)
-            self.cpu_infer.submit(self.moe.load_weights())
-            self.cpu_infer.sync()
-            
-            # Set flag to avoid reconversion
-            self.needs_dynamic_conversion = False
-        
         # generate, capture and run cuda graph
         # print(expert_ids)
         if bsz_tensor is None:

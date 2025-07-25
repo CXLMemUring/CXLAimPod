@@ -1553,7 +1553,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.finfo(dtype).min
+        min_dtype = torch.iinfo(torch.int8).min
         sequence_length = input_tensor.shape[1]
         if using_static_cache:
             target_length = past_key_values.get_max_length()

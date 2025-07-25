@@ -19,6 +19,7 @@ from ktransformers.util.cuda_graph_runner import CUDAGraphRunner
 from ktransformers.util.textstream import TextStreamer
 from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
 import socket
+import intel_extension_for_pytorch as ipex
 
 warm_uped = False
 
@@ -199,7 +200,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
 
     tokens = []
     
-    def decode_one_tokens(cuda_graph_runner, cur_token, position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph: bool = False):
+    def decode_one_tokens(model, cuda_graph_runner, cur_token, position_ids, cache_position, past_key_values, logits_warper, generation_config, use_cuda_graph: bool = False):
         # Always use CPU path, never CUDA graph
         use_cuda_graph = False
         try:
@@ -256,10 +257,9 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                     'use_cache': True,
                     'return_dict': True
                 }
-                
                 # Run the model with proper error handling
                 outputs = model(**model_inputs)
-                
+
                 # Extract logits and ensure they're in compute_dtype
                 if hasattr(outputs, 'logits'):
                     logits = outputs.logits.to(dtype=compute_dtype)
@@ -305,7 +305,6 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                         'use_cache': True,
                         'return_dict': True
                     }
-                    
                     outputs = model(**model_inputs)
                     
                     # Convert logits back to compute_dtype
@@ -351,7 +350,6 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                             'use_cache': True,
                             'return_dict': True
                         }
-                        
                         outputs = model(**model_inputs)
                         
                         # Convert logits back to compute_dtype
@@ -412,13 +410,16 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             traceback.print_exc()
             # Return a fallback token as last resort instead of crashing
             print("Returning fallback token (EOS) due to critical error")
-            if hasattr(model.config, 'eos_token_id'):
-                fallback_token = torch.tensor([model.config.eos_token_id], device="cpu")
-            else:
-                fallback_token = torch.tensor([0], device="cpu")  # Use token ID 0 as default fallback
+            try:
+                if hasattr(model, 'config') and hasattr(model.config, 'eos_token_id'):
+                    fallback_token = torch.tensor([model.config.eos_token_id], device="cpu")
+                else:
+                    fallback_token = torch.tensor([1], device="cpu")  # Use token ID 1 as default fallback
+            except:
+                fallback_token = torch.tensor([1], device="cpu")  # Use token ID 1 as default fallback
             return fallback_token
     
-    def chunk_prefill(inputs, cache_position, past_key_values):
+    def chunk_prefill(model, inputs, cache_position, past_key_values):
         try:
             # 检查并强制限制token在vocab范围内
             vocab_size = 32000
@@ -703,7 +704,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
             chunk_end = min(chunk_start + chunk_size, seq_length)
             if past_key_values != None:
                 past_key_values.cur_idx=cache_position[chunk_start:chunk_end]
-            logits = chunk_prefill(inputs[:, chunk_start:chunk_end], cache_position[chunk_start:chunk_end], past_key_values)
+            logits = chunk_prefill(model, inputs[:, chunk_start:chunk_end], cache_position[chunk_start:chunk_end], past_key_values)
             chunk_start += chunk_size
 
         # Handle different logits dimensions
@@ -833,6 +834,7 @@ def prefill_and_generate(model, tokenizer, inputs, max_new_tokens=10000, use_cud
                 print(f"Calling decode_one_tokens with token shape: {next_token_input.shape}")
                 
                 next_token = decode_one_tokens(
+                    model,
                     None, 
                     next_token_input, 
                     position_ids, 

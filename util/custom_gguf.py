@@ -307,7 +307,10 @@ class GGUFLoader:
         item_type = t["item_type"]
         item_count = t["item_count"]
         itemsize = int(np.empty([], dtype = item_type).itemsize)
-        return mmap_data[offset : offset + itemsize * item_count]
+        
+        # Return as numpy array to avoid dynamo issues with mmap slices
+        mmap_slice = mmap_data[offset : offset + itemsize * item_count]
+        return np.frombuffer(mmap_slice, dtype=item_type)
     
     def get_undequanted_tensor_and_ggml_type(self, name):
         t = self.tensor_info[name]
