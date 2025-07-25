@@ -372,27 +372,11 @@ class GGUFLoader:
         num_blocks = num_elements // elements_per_block
         
         blocks_per_iter = 16384
-        if num_blocks > blocks_per_iter: # dequant large tensor
-            values = torch.empty((num_blocks, elements_per_block), dtype=target_dtype, device=device)
-            for i in range( (num_blocks + blocks_per_iter - 1) // blocks_per_iter):
-                blocks_begin = i * blocks_per_iter
-                blocks_end = min(blocks_begin + blocks_per_iter, num_blocks)
-                if "cpu" in device.lower():
-                    cur_values = GGML_DEQUANTIZE_GPU[ggml_name](data[blocks_begin*block_size : blocks_end*block_size], device, target_dtype)
-                else:
-                    cur_values = GGML_DEQUANTIZE[ggml_name](data[blocks_begin*block_size : blocks_end*block_size])
-                    cur_values = torch.from_numpy(cur_values.copy())
-                
-                cur_values = cur_values.view(-1, elements_per_block)
-                if ggml_name == "BF16":
-                    cur_values = cur_values.view(torch.bfloat16)
-                values[blocks_begin : blocks_end] = cur_values
+        if "cpu" in device.lower():
+            values = GGML_DEQUANTIZE_GPU[ggml_name](data, device)
         else:
-            if "cpu" in device.lower():
-                values = GGML_DEQUANTIZE_GPU[ggml_name](data, device)
-            else:
-                values = GGML_DEQUANTIZE[ggml_name](data)
-                values = torch.from_numpy(values)
+            values = GGML_DEQUANTIZE[ggml_name](data)
+            values = torch.from_numpy(values)
                 
         if ggml_name == "BF16":
             values = values.view(torch.bfloat16)
