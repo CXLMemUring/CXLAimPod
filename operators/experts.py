@@ -213,7 +213,6 @@ class KExpertsCPU(KExpertsBase):
                 self.config.hidden_size,
                 self.config.moe_intermediate_size,
                 max(cuda_graphs) if isinstance(cuda_graphs, list) else Config().chunk_size,
-                self.config.hidden_act == 'silu',
                 gate_ptr,
                 up_ptr,
                 down_ptr,
@@ -287,6 +286,8 @@ class KExpertsCPU(KExpertsBase):
             self.moe = AMXInt8_MOE(moe_config)
             self.cpu_infer.submit(self.moe.load_weights_int8())
             self.cpu_infer.sync()
+        elif self.backend == "AMXDynamicInt8":
+            pass
         else:
             raise ValueError(f"Unsupported backend: {self.backend}. Supported backends are: llamafile, AMXBF16, AMXInt8")
         # print(n_routed_experts, hidden_size, moe_intermediate_size)

@@ -29,16 +29,12 @@ from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 # from transformers.integrations import use_kernel_forward_from_hub
-from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
-from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
-# from transformers.utils import TransformersKwargs, auto_docstring, can_return_tuple
-from transformers.utils import auto_docstring, can_return_tuple
-# from transformers.utils.generic import check_model_inputs
+from transformers.utils import can_return_tuple
 from .configuration_glm4_moe import Glm4MoeConfig
 
 
@@ -346,7 +342,7 @@ class Glm4MoeMoE(nn.Module):
         return hidden_states
 
 
-class Glm4MoeDecoderLayer(GradientCheckpointingLayer):
+class Glm4MoeDecoderLayer(nn.Module):
     def __init__(self, config: Glm4MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -394,7 +390,6 @@ class Glm4MoeDecoderLayer(GradientCheckpointingLayer):
         return hidden_states
 
 
-@auto_docstring
 class Glm4MoePreTrainedModel(PreTrainedModel):
     config: Glm4MoeConfig
     base_model_prefix = "model"
@@ -461,7 +456,6 @@ class Glm4MoeRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
-@auto_docstring
 class Glm4MoeModel(Glm4MoePreTrainedModel):
     _keys_to_ignore_on_load_unexpected = [r"model\.layers\.92.*", r"model\.layers\.46.*"]
 
@@ -488,7 +482,6 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         self.embed_tokens = value
 
     # @check_model_inputs
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -547,7 +540,6 @@ class Glm4MoeModel(Glm4MoePreTrainedModel):
         )
 
 
-@auto_docstring
 class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
@@ -581,7 +573,6 @@ class Glm4MoeForCausalLM(Glm4MoePreTrainedModel, GenerationMixin):
         return self.model
 
     @can_return_tuple
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
