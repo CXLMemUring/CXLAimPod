@@ -12,8 +12,8 @@
   replace:
     class: ktransformers.operators.RoPE.YarnRotaryEmbedding
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 - match:
     name: "^model\\.layers\\.([12][0-9])\\."
     class: ktransformers.models.modeling_deepseek.DeepseekV2YarnRotaryEmbedding
@@ -29,8 +29,8 @@
   replace:
     class: ktransformers.operators.linear.KTransformersLinear  # optimized Kernel on quantized data types
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
       generate_op: "KLinearMarlin"
       prefill_op: "KLinearTorch"
 
@@ -51,8 +51,8 @@
   replace:
     class: ktransformers.operators.experts.KDeepseekV2MoE     # mlp module with custom forward function
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 - match:
     name: "^model\\.layers\\.([12][0-9])\\.mlp$"
     class: ktransformers.models.modeling_deepseek.DeepseekV2MoE
@@ -67,11 +67,11 @@
   replace:
     class: ktransformers.operators.experts.KTransformersExperts     # custom MoE Kernel with expert paralleism
     kwargs:
-      prefill_device: "cuda:0"
+      prefill_device: "cpu"
       prefill_op: "KExpertsTorch"
       generate_device: "cpu"
       generate_op:  "KExpertsCPU"
-      out_device: "cuda:0"
+      out_device: "cpu"
   recursive: False # don't recursively inject submodules of this module
 
 - match:
@@ -91,8 +91,8 @@
   replace:
     class: ktransformers.operators.attention.KDeepseekV2Attention # optimized MLA implementation
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 - match:
     name: "^model\\.layers\\.([12][0-9])\\.self_attn$"
   replace:
@@ -114,8 +114,8 @@
   replace:
     class: "default"
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 
 - match:
     name: "^lm_head"

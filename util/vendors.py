@@ -22,11 +22,55 @@ class DeviceManager:
     
     def _detect_gpu_vendor(self) -> GPUVendor:
         """Detect GPU vendor type"""
+        if not torch.cuda.is_available():
+            # Check MUSA availability (assuming a musa module exists)
+            try:
+                import musa
+                if musa.is_available():
+                    return GPUVendor.MUSA
+            except (ImportError, AttributeError):
+                pass
+            
+            return GPUVendor.Unknown
+        
+        device_name = torch.cuda.get_device_name(0).lower()
+        
+        if any(name in device_name for name in ["nvidia", "geforce", "quadro", "tesla", "titan", "rtx", "gtx"]):
+            return GPUVendor.NVIDIA
+        elif any(name in device_name for name in ["amd", "radeon", "rx", "vega", "instinct", "firepro", "mi"]):
+            return GPUVendor.AMD
+        elif any(name in device_name for name in ["mthreads", "moore", "mtt"]):
+            return GPUVendor.MooreThreads
+        elif any(name in device_name for name in ["metax", "meta"]):
+            return GPUVendor.MetaX
+        elif "musa" in device_name:
+            return GPUVendor.MUSA
+        
+        # Backend check
+        try:
+            if hasattr(torch.version, 'hip') and torch.version.hip is not None:
+                return GPUVendor.AMD
+            elif hasattr(torch.version, 'cuda') and torch.version.cuda is not None:
+                return GPUVendor.NVIDIA
+        except:
+            pass
+            
         return GPUVendor.Unknown
     
     def _get_available_devices(self) -> List[int]:
         """Get list of available device indices"""
-        return ["cpu"]
+        devices = []
+        
+        if self.gpu_vendor == GPUVendor.NVIDIA or self.gpu_vendor == GPUVendor.AMD:
+            devices = list(range(torch.cuda.device_count()))
+        elif self.gpu_vendor == GPUVendor.MUSA:
+            try:
+                import musa
+                devices = list(range(musa.device_count()))
+            except (ImportError, AttributeError):
+                pass
+            
+        return devices
     
     def get_device_str(self, device_id: Union[int, str]) -> str:
         """
@@ -36,8 +80,23 @@ class DeviceManager:
             device_id: Device index (0, 1, 2, etc.), -1 for CPU, or "cpu" string
             
         Returns:
-            Device string representation (e.g., "cuda:0", "musa:1", "cpu")
+            Device string representation (e.g., "cpu", "musa:1", "cpu")
         """
+        if device_id == -1 or device_id == "cpu":
+            return "cpu"
+            
+        if isinstance(device_id, int):
+            if self.gpu_vendor == GPUVendor.NVIDIA or self.gpu_vendor == GPUVendor.AMD:
+                if device_id < torch.cuda.device_count():
+                    return f"cuda:{device_id}"
+            elif self.gpu_vendor == GPUVendor.MUSA:
+                try:
+                    import musa
+                    if device_id < musa.device_count():
+                        return f"musa:{device_id}"
+                except (ImportError, AttributeError):
+                    pass
+        
         return "cpu"
     
     def to_torch_device(self, device_id: Union[int, str] = 0) -> torch.device:
@@ -50,7 +109,19 @@ class DeviceManager:
         Returns:
             torch.device object
         """
-        return torch.device("cpu")
+        device_str = self.get_device_str(device_id)
+        
+        # Handle MUSA device
+        if device_str.startswith("musa:"):
+            try:
+                import musa
+                index = int(device_str.split(":")[-1])
+                return musa.device(index)
+            except (ImportError, ValueError, AttributeError):
+                return torch.device("cpu")
+        
+        # Standard PyTorch device
+        return torch.device(device_str)
     
     def move_tensor_to_device(self, tensor: torch.Tensor, device_id: Union[int, str] = 0) -> torch.Tensor:
         """
@@ -63,7 +134,8 @@ class DeviceManager:
         Returns:
             Tensor moved to the specified device
         """
-        return tensor.to("cpu")
+        device = self.to_torch_device(device_id)
+        return tensor.to(device)
     
     def is_available(self, index: int = 0) -> bool:
         """

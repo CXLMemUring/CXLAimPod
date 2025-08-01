@@ -40,8 +40,8 @@
   replace:
     class: ktransformers.operators.gate.KMoEGate
     kwargs:
-      generate_device: "cuda:0"
-      prefill_device: "cuda:0"
+      generate_device: "cpu"
+      prefill_device: "cpu"
 - match:
     name: "^model\\.layers\\..*\\.mlp\\.experts$"
   replace:

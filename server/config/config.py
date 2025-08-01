@@ -101,7 +101,7 @@ class Config(metaclass=Singleton):
         self.model_path: str = self.model_dir
         self.model_name: str = self.model.get("name", "")
         self.architectures: str = self.model.get("name", "")
-        self.model_device: str = self.model.get("device", "cuda:0")
+        self.model_device: str = self.model.get("device", "cpu")
         self.gguf_path: Optional[str] = self.model.get("gguf_path", None)
         self.use_cuda_graph = self.model.get("use_cuda_graph", True)
         self.trust_remote_code = self.model.get("trust_remote_code", True)
@@ -203,6 +203,7 @@ class Config(metaclass=Singleton):
         self.gpu_memory_size = 2*576*61*self.cache_lens
         self.utilization_percentage = 1.0 #cfg["kvc2"]["utilization_percentage"]
         self.cpu_memory_size_GB = cfg["kvc2"]["cpu_memory_size_GB"]
+        self.kvc2_disk_path = cfg["kvc2"]["disk_path"]
         # only support 2 prefill task
         self.max_prefill_batch_size = 2
         self.max_decode_batch_size = self.max_batch_size - self.max_prefill_batch_size 

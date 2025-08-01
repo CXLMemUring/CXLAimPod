@@ -1,12 +1,6 @@
 import torch
+import flashinfer
 import gc
-
-flashinfer = None
-if torch.cuda.is_available():
-    try:
-        import flashinfer
-    except ImportError:
-        pass
 try:
     from flash_attn import flash_attn_with_kvcache
     print("found flash_attn")
@@ -18,8 +12,7 @@ from typing import Union, Optional
 
 def setup_seed(seed):
 	torch.manual_seed(seed)
-	if torch.cuda.is_available():
-		torch.cuda.manual_seed_all(seed)
+	torch.cuda.manual_seed_all(seed)
 
 setup_seed(998244353)
 
@@ -27,10 +20,9 @@ torch.set_grad_enabled(False)
 torch.set_default_dtype(torch.bfloat16)
 global_dtype=torch.bfloat16
 global_device=torch.device("cpu",0)
-if torch.cuda.is_available():
-	torch.cuda.set_device(0)
-	torch.backends.cudnn.enabled =True
-	torch.backends.cudnn.benchmark = True
+torch.cuda.set_device(0)
+torch.backends.cudnn.enabled =True
+torch.backends.cudnn.benchmark = True
 
 class flashInferAttn():
 	
@@ -48,7 +40,7 @@ class flashInferAttn():
 		self.kv_layout = kv_layout
 		self.use_cuda_graph = use_cuda_graph
 		if flashInferAttn.float_workspace_buffer is None:
-			flashInferAttn.float_workspace_buffer = torch.empty(1024 * 1024 * 1024, dtype=torch.uint8, device=device)
+			flashInferAttn.float_workspace_buffer = torch.empty(max_batch_token * 1024 * 1024, dtype=torch.uint8, device=device)
 		self.qo_indptr_buf = torch.empty((max_batch_size+1,), dtype=torch.int32, device=device)
 		self.paged_kv_indptr_buf = torch.empty((max_batch_size+1,), dtype=torch.int32, device=device)
 		self.paged_kv_indices_buf = torch.empty((max_pages,), dtype=torch.int32, device=device)
@@ -279,7 +271,7 @@ def testAttentionFlashInfer(
 	page_size = 32
 	num_pages_per_seq = (past_kv_1 + page_size - 1) // page_size
 	total_num_pages = (num_pages_per_seq + 1) * (batch_decode + 1) + prefill_chunk // page_size
-	workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cpu)
+	workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cpu")
 	qs = []
 	kvs = []
 	q_indptrs = []

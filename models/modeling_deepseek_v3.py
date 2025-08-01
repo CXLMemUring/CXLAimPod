@@ -30,6 +30,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache, StaticCache
+from transformers.generation import GenerationMixin
 from transformers.modeling_attn_mask_utils import (
     AttentionMaskConverter,
     _prepare_4d_attention_mask,
@@ -1553,7 +1554,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
                 return None
 
         dtype, device = input_tensor.dtype, input_tensor.device
-        min_dtype = torch.iinfo(torch.int8).min
+        min_dtype = torch.finfo(dtype).min
         sequence_length = input_tensor.shape[1]
         if using_static_cache:
             target_length = past_key_values.get_max_length()
@@ -1598,7 +1599,7 @@ class DeepseekV3Model(DeepseekV3PreTrainedModel):
 
         return causal_mask
 
-class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel):
+class DeepseekV3ForCausalLM(DeepseekV3PreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
 
     def __init__(self, config):

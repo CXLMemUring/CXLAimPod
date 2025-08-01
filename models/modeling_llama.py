@@ -81,7 +81,7 @@ class LlamaRotaryEmbedding(nn.Module):
         dim=None,
         max_position_embeddings=2048,
         base=10000,
-        device="cpu",
+        device=None,
         scaling_factor=1.0,
         rope_type="default",
         config: Optional[LlamaConfig] = None,
@@ -90,14 +90,7 @@ class LlamaRotaryEmbedding(nn.Module):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
         self.base = base
-        
-        # Handle meta device by forcing CPU initialization
-        if isinstance(device, str) and 'meta' in device:
-            print(f"Warning: Meta device detected: {device}. Using CPU for RoPE initialization.")
-            self.device = "cpu"
-        else:
-            self.device = device
-            
+        self.device = device
         self.scaling_factor = scaling_factor
         self.rope_type = rope_type
         self.config = config
@@ -132,24 +125,11 @@ class LlamaRotaryEmbedding(nn.Module):
         self.config = config
         self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
 
-        try:
-            inv_freq, self.attention_scaling = self.rope_init_fn(
-                self.config, self.device, **self.rope_kwargs
-            )
-            self.register_buffer("inv_freq", inv_freq, persistent=False)
-            self.original_inv_freq = self.inv_freq
-        except NotImplementedError as e:
-            # Handle "Cannot copy out of meta tensor" error
-            if "meta tensor" in str(e):
-                print(f"Meta tensor error during RoPE initialization: {e}. Using CPU.")
-                # Try again with CPU device
-                inv_freq, self.attention_scaling = self.rope_init_fn(
-                    self.config, "cpu", **self.rope_kwargs
-                )
-                self.register_buffer("inv_freq", inv_freq, persistent=False)
-                self.original_inv_freq = self.inv_freq
-            else:
-                raise
+        inv_freq, self.attention_scaling = self.rope_init_fn(
+            self.config, device, **self.rope_kwargs
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
 
     def _dynamic_frequency_update(self, position_ids, device):
         """
@@ -267,30 +247,21 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class LlamaMLP(nn.Module):
-    def __init__(
-        self,
-        config: LlamaConfig,
-        act_fn: Optional[str] = None,
-    ):
+    def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        if act_fn is not None:
-            self.act_fn = ACT2FN[act_fn]
-        else:
-            self.act_fn = ACT2FN[config.hidden_act]
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-        
-    def _ensure_dtype_match(self, input_tensor, weight_tensor):
-        """Ensure input and weight tensors have matching dtypes for linear operations"""
-        if input_tensor.dtype != weight_tensor.dtype:
-            # Convert input to match weight dtype
-            input_tensor = input_tensor.to(dtype=weight_tensor.dtype)
-        return input_tensor
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
+        )
+        self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
         if self.config.pretraining_tp > 1:
@@ -321,194 +292,7 @@ class LlamaMLP(nn.Module):
             ]
             down_proj = sum(down_proj)
         else:
-            try:
-                # Ensure x has the same dtype as the weight tensors
-                x = self._ensure_dtype_match(x, self.gate_proj.weight)
-                
-                # Check for shape mismatches
-                x_shape = x.shape 
-                if len(x_shape) > 2 and x_shape[-1] != self.hidden_size:
-                    print(f"Warning: Input tensor shape {x_shape} has wrong feature dimension. Expected {self.hidden_size}, got {x_shape[-1]}")
-                    # Try to reshape to correct dimensions
-                    orig_shape = x_shape
-                    x = x.reshape(-1, self.hidden_size)
-                    print(f"Reshaped input from {orig_shape} to {x.shape}")
-                
-                # Forward computation
-                gate_proj = self.gate_proj(x)
-                up_proj = self.up_proj(x)
-                
-                intermediate_states = self.act_fn(gate_proj) * up_proj
-                down_proj = self.down_proj(intermediate_states)
-                
-                # Restore original shape if needed
-                if len(x_shape) > 2:
-                    down_proj = down_proj.view(*x_shape[:-1], self.hidden_size)
-                
-            except RuntimeError as e:
-                error_msg = str(e)
-                print(f"Handling error in MLP forward: {error_msg}")
-                
-                if "mat1 and mat2 shapes cannot be multiplied" in error_msg:
-                    # Get input shape information
-                    x_shape = x.shape
-                    print(f"Input shape: {x_shape}, Hidden size: {self.hidden_size}")
-                    
-                    # Try to reshape the input to make matrix multiplication work
-                    try:
-                        # Save original shape to reshape output later
-                        orig_shape = x_shape
-                        x_flattened = x.reshape(-1, x_shape[-1])
-                        
-                        # Check if we need to pad or truncate
-                        if x_shape[-1] < self.hidden_size:
-                            # Pad tensor to match expected dimensions
-                            padding = torch.zeros(*x_flattened.shape[:-1], self.hidden_size - x_shape[-1], 
-                                                 device=x.device, dtype=x.dtype)
-                            x_flattened = torch.cat([x_flattened, padding], dim=-1)
-                        elif x_shape[-1] > self.hidden_size:
-                            # Truncate tensor to match expected dimensions
-                            x_flattened = x_flattened[..., :self.hidden_size]
-                        
-                        # Ensure dtype match
-                        x_flattened = self._ensure_dtype_match(x_flattened, self.gate_proj.weight)
-                        
-                        # Process the reshaped tensor
-                        gate_proj = self.gate_proj(x_flattened)
-                        up_proj = self.up_proj(x_flattened)
-                        
-                        intermediate_states = self.act_fn(gate_proj) * up_proj
-                        down_proj = self.down_proj(intermediate_states)
-                        
-                        # Reshape output back to match original input shape
-                        down_proj = down_proj.view(*orig_shape[:-1], self.hidden_size)
-                        print(f"Successfully reshaped output to {down_proj.shape}")
-                    except Exception as reshape_error:
-                        print(f"Failed to handle reshape: {reshape_error}")
-                        # Last resort fallback - create a tensor of the expected shape
-                        down_proj = torch.zeros(*x_shape[:-1], self.hidden_size, device=x.device, dtype=x.dtype)
-                
-                elif "expected m1 and m2 to have the same dtype" in error_msg:
-                    # Handle dtype mismatch
-                    weight_dtype = self.gate_proj.weight.dtype
-                    x = x.to(dtype=weight_dtype)
-                    gate_proj = self.gate_proj(x)
-                    up_proj = self.up_proj(x)
-                    intermediate_states = self.act_fn(gate_proj) * up_proj
-                    down_proj = self.down_proj(intermediate_states)
-                
-                elif "invalid for input of size" in error_msg:
-                    print(f"Handling tensor size mismatch error: {error_msg}")
-                    # Get actual tensor size
-                    actual_size = 0
-                    try:
-                        # Extract the actual size from the error message
-                        import re
-                        size_match = re.search(r'input of size (\d+)', error_msg)
-                        if size_match:
-                            actual_size = int(size_match.group(1))
-                        else:
-                            # If not found in error message, calculate from tensor
-                            if 'intermediate_states' in locals() and intermediate_states is not None:
-                                actual_size = intermediate_states.numel()
-                            elif 'gate_proj' in locals() and gate_proj is not None:
-                                actual_size = gate_proj.numel()
-                            else:
-                                actual_size = x.numel()
-                        
-                        print(f"Actual tensor size: {actual_size}")
-                        
-                        # Extract shape information
-                        shape_info = {}
-                        if len(x_shape) >= 3:
-                            batch_size, seq_len = x_shape[0], x_shape[1]
-                            shape_info['batch_size'] = batch_size
-                            shape_info['seq_len'] = seq_len
-                        elif len(x_shape) == 2:
-                            batch_size, seq_len = 1, x_shape[0]
-                            shape_info['batch_size'] = batch_size
-                            shape_info['seq_len'] = seq_len
-                        else:
-                            batch_size, seq_len = 1, 1
-                            shape_info['batch_size'] = batch_size
-                            shape_info['seq_len'] = seq_len
-                            
-                        # Use intermediate size from the model config
-                        expected_in_features = self.intermediate_size
-                        shape_info['in_features'] = expected_in_features
-                        required_size = shape_info['batch_size'] * shape_info['seq_len'] * expected_in_features
-                        
-                        print(f"Target shape info: {shape_info}, required size: {required_size}")
-                        
-                        # Calculate a feasible new shape
-                        if actual_size < required_size:
-                            # Padding case - create a larger tensor and copy data
-                            print(f"Padding tensor from {actual_size} to {required_size} elements")
-                            if 'intermediate_states' in locals() and intermediate_states is not None:
-                                flat_tensor = intermediate_states.reshape(-1)
-                                new_tensor = torch.zeros(required_size, dtype=flat_tensor.dtype, device=flat_tensor.device)
-                                new_tensor[:actual_size] = flat_tensor
-                                intermediate_states = new_tensor.reshape(batch_size, seq_len, expected_in_features)
-                                down_proj = self.down_proj(intermediate_states)
-                            else:
-                                # If we don't have intermediate states yet, process from the beginning
-                                gate_proj = self.gate_proj(x)
-                                up_proj = self.up_proj(x)
-                                intermediate_result = self.act_fn(gate_proj) * up_proj
-                                
-                                # Reshape to correct dimensions with padding
-                                flat_tensor = intermediate_result.reshape(-1)
-                                new_tensor = torch.zeros(required_size, dtype=flat_tensor.dtype, device=flat_tensor.device)
-                                new_tensor[:actual_size] = flat_tensor
-                                intermediate_states = new_tensor.reshape(batch_size, seq_len, expected_in_features)
-                                down_proj = self.down_proj(intermediate_states)
-                        else:
-                            # Truncation case - need to find a valid shape that works
-                            print(f"Adjusting tensor from {actual_size} to fit constraints")
-                            if 'intermediate_states' in locals() and intermediate_states is not None:
-                                # Find the largest multiple of batch_size * seq_len that fits
-                                adjusted_features = actual_size // (batch_size * seq_len)
-                                print(f"Adjusting in_features from {expected_in_features} to {adjusted_features}")
-                                
-                                # Reshape to the adjusted shape
-                                intermediate_states = intermediate_states.reshape(batch_size, seq_len, adjusted_features)
-                                
-                                # Use a linear projection to get to the expected size
-                                temp_proj = nn.Linear(adjusted_features, expected_in_features, 
-                                                    device=intermediate_states.device, 
-                                                    dtype=intermediate_states.dtype).to(intermediate_states.device)
-                                intermediate_states = temp_proj(intermediate_states)
-                                
-                                # Now we can apply the down projection as usual
-                                down_proj = self.down_proj(intermediate_states)
-                            else:
-                                # Start from scratch
-                                gate_proj = self.gate_proj(x)
-                                up_proj = self.up_proj(x)
-                                intermediate_result = self.act_fn(gate_proj) * up_proj
-                                
-                                # Find adjusted feature size
-                                adjusted_features = actual_size // (batch_size * seq_len)
-                                intermediate_result = intermediate_result.reshape(batch_size, seq_len, adjusted_features)
-                                
-                                # Project to expected size
-                                temp_proj = nn.Linear(adjusted_features, expected_in_features, 
-                                                    device=intermediate_result.device, 
-                                                    dtype=intermediate_result.dtype).to(intermediate_result.device)
-                                intermediate_states = temp_proj(intermediate_result)
-                                down_proj = self.down_proj(intermediate_states)
-                        
-                        print(f"Successfully handled size mismatch, output shape: {down_proj.shape}")
-                    except Exception as size_error:
-                        print(f"Failed to handle size mismatch: {size_error}")
-                        # Last resort fallback - create zeros tensor with expected output shape
-                        down_proj = torch.zeros(*x_shape[:-1], self.hidden_size, device=x.device, dtype=x.dtype)
-                
-                else:
-                    # For unknown errors, print detailed info and re-raise
-                    print(f"Unknown error in MLP. Input shape: {x.shape}, dtype: {x.dtype}")
-                    print(f"Gate weight shape: {self.gate_proj.weight.shape}, dtype: {self.gate_proj.weight.dtype}")
-                    raise
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
         return down_proj
 
@@ -575,60 +359,7 @@ class LlamaAttention(nn.Module):
         )
 
         # TODO (joao): remove in v4.45 (RoPE is computed in the model, not in the decoder layers)
-        try:
-            # Try to initialize with the normal flow
-            self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
-        except NotImplementedError as e:
-            # If we get a meta tensor error, initialize with CPU device
-            if "meta tensor" in str(e):
-                print(f"Error in LlamaAttention RoPE init: {e}. Using CPU fallback.")
-                # Special configuration for CPU-only initialization
-                self.config.device = "cpu"  # Temporarily modify config
-                self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
-                self.config.device = None  # Reset device
-            else:
-                raise
-        
-    def _ensure_dtype_match(self, tensor, target_dtype):
-        """Ensure tensor has the correct dtype"""
-        if tensor.dtype != target_dtype:
-            return tensor.to(dtype=target_dtype)
-        return tensor
-        
-    def _safe_reshape(self, tensor, batch_size, seq_len, num_heads, head_dim):
-        """Safely reshape tensors, handling errors gracefully"""
-        try:
-            expected_size = batch_size * seq_len * num_heads * head_dim
-            actual_size = tensor.numel()
-            
-            if expected_size != actual_size:
-                print(f"Shape mismatch in attention reshaping: tensor has {actual_size} elements, "
-                      f"but target shape ({batch_size}, {seq_len}, {num_heads}, {head_dim}) needs {expected_size} elements")
-                
-                if actual_size > expected_size:
-                    # Tensor has more elements than needed, truncate it
-                    print(f"Truncating tensor from {tensor.shape} with {actual_size} elements to fit {expected_size} elements")
-                    tensor_flat = tensor.reshape(-1)[:expected_size]
-                    return tensor_flat.reshape(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-                else:
-                    # Tensor has fewer elements than needed, pad it
-                    print(f"Padding tensor from {tensor.shape} with {actual_size} elements to {expected_size} elements")
-                    padded_tensor = torch.zeros(expected_size, dtype=tensor.dtype, device=tensor.device)
-                    tensor_flat = tensor.reshape(-1)
-                    padded_tensor[:actual_size] = tensor_flat
-                    return padded_tensor.reshape(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-            
-            # No issues with size, do the standard reshape
-            return tensor.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
-            
-        except RuntimeError as e:
-            print(f"Error reshaping tensor: {e}")
-            print(f"Tensor shape: {tensor.shape}, Target shape: [{batch_size}, {seq_len}, {num_heads}, {head_dim}]")
-            
-            # Create a new tensor with the correct shape filled with zeros as fallback
-            print("Creating fallback zero tensor with correct shape")
-            return torch.zeros(batch_size, num_heads, seq_len, head_dim, 
-                              dtype=tensor.dtype, device=tensor.device)
+        self.rotary_emb = LlamaRotaryEmbedding(config=self.config)
 
     def forward(
         self,
@@ -675,38 +406,30 @@ class LlamaAttention(nn.Module):
             value_states = torch.cat(value_states, dim=-1)
 
         else:
-            try:
-                # Ensure hidden_states has the same dtype as the projection weights
-                query_dtype = self.q_proj.weight.dtype
-                hidden_states = self._ensure_dtype_match(hidden_states, query_dtype)
-                
-                query_states = self.q_proj(hidden_states)
-                key_states = self.k_proj(hidden_states)
-                value_states = self.v_proj(hidden_states)
-            except RuntimeError as e:
-                print(f"Error in attention projection: {e}")
-                # Fallback: if there's a dtype issue, try with float32
-                hidden_states_float = hidden_states.to(dtype=torch.float32)
-                query_states = F.linear(hidden_states_float, self.q_proj.weight.to(torch.float32))
-                key_states = F.linear(hidden_states_float, self.k_proj.weight.to(torch.float32))
-                value_states = F.linear(hidden_states_float, self.v_proj.weight.to(torch.float32))
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
 
-        try:
-            # Reshape query states safely
-            query_states = self._safe_reshape(query_states, bsz, q_len, self.num_heads, self.head_dim)
-            
-            # Reshape key states safely
-            key_states = self._safe_reshape(key_states, bsz, q_len, self.num_key_value_heads, self.head_dim)
-            
-            # Reshape value states safely
-            value_states = self._safe_reshape(value_states, bsz, q_len, self.num_key_value_heads, self.head_dim)
-        except Exception as e:
-            print(f"Critical reshape error: {e}")
-            # Last resort fallback - using basic shapes with safe dimensions
-            query_states = query_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            key_states = key_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-            value_states = value_states.reshape(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(
+            bsz, q_len, self.num_heads, self.head_dim
+        ).transpose(1, 2)
+        key_states = key_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
+        value_states = value_states.view(
+            bsz, q_len, self.num_key_value_heads, self.head_dim
+        ).transpose(1, 2)
 
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
         )
@@ -1246,52 +969,14 @@ class LlamaModel(LlamaPreTrainedModel):
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, self.padding_idx
         )
-        
-        # Create decoder layers safely
-        try:
-            self.layers = nn.ModuleList(
-                [
-                    LlamaDecoderLayer(config, layer_idx)
-                    for layer_idx in range(config.num_hidden_layers)
-                ]
-            )
-        except NotImplementedError as e:
-            if "meta tensor" in str(e):
-                print(f"Meta tensor error in decoder layers creation: {e}. Creating layers differently.")
-                # Alternative initialization approach
-                self.layers = nn.ModuleList()
-                for layer_idx in range(config.num_hidden_layers):
-                    try:
-                        layer = LlamaDecoderLayer(config, layer_idx)
-                        self.layers.append(layer)
-                    except Exception as layer_error:
-                        print(f"Error creating layer {layer_idx}: {layer_error}. Using CPU.")
-                        # Try with CPU device setting
-                        old_device = getattr(config, 'device', None)
-                        config.device = "cpu"
-                        layer = LlamaDecoderLayer(config, layer_idx)
-                        self.layers.append(layer)
-                        if old_device is not None:
-                            config.device = old_device
-                        else:
-                            delattr(config, 'device')
-            else:
-                raise
-                
+        self.layers = nn.ModuleList(
+            [
+                LlamaDecoderLayer(config, layer_idx)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
+        )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        # Initialize the rotary embeddings safely
-        try:
-            # Try with standard initialization
-            self.rotary_emb = LlamaRotaryEmbedding(config=config)
-        except NotImplementedError as e:
-            if "meta tensor" in str(e):
-                print(f"Meta tensor error in LlamaModel RoPE init: {e}. Using CPU device.")
-                # Fallback to CPU initialization
-                self.rotary_emb = LlamaRotaryEmbedding(config=config, device="cpu")
-            else:
-                raise
-                
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
@@ -1553,56 +1238,12 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        
-        try:
-            # Track whether we're in fallback mode
-            self._is_fallback_mode = False
-            
-            # Try to create the model with error handling
-            self.model = LlamaModel(config)
-            self.vocab_size = config.vocab_size
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-            
-            # Initialize weights and apply final processing
-            self.post_init()
-            
-        except Exception as e:
-            print(f"Error during LlamaForCausalLM initialization: {e}")
-            print("Attempting to create model with CPU-only safe mode...")
-            
-            # Mark as fallback mode
-            self._is_fallback_mode = True
-            
-            # Save original device settings
-            original_device = getattr(config, 'device', None)
-            
-            # Force CPU for initialization
-            config.device = "cpu"
-            
-            # Try again with CPU
-            try:
-                self.model = LlamaModel(config)
-                self.vocab_size = config.vocab_size
-                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-                
-                # Restore original device if it existed
-                if original_device is not None:
-                    config.device = original_device
-                else:
-                    delattr(config, 'device')
-                    
-                # Initialize weights and apply final processing
-                self.post_init()
-                print("Successfully created model in CPU fallback mode")
-            except Exception as fallback_error:
-                print(f"Critical error in fallback initialization: {fallback_error}")
-                print("Creating minimal model structure to prevent complete failure")
-                
-                # Create minimal functioning model
-                self.model = LlamaModel(config)
-                self.vocab_size = config.vocab_size
-                self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-                print("Created basic model structure, functionality may be limited")
+        self.model = LlamaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+        # Initialize weights and apply final processing
+        self.post_init()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -1621,46 +1262,6 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
     def get_decoder(self):
         return self.model
-
-    def _get_logits_warper(self, generation_config, device=None):
-        from transformers.generation.logits_process import (
-            LogitsProcessorList,
-            TemperatureLogitsWarper,
-            TopPLogitsWarper,
-            TopKLogitsWarper,
-            MinPLogitsWarper,
-            TypicalLogitsWarper,
-        )
-        
-        # Initialize with an empty processor list
-        warpers = LogitsProcessorList()
-        
-        # Add temperature warper if applicable
-        temperature = generation_config.temperature
-        if temperature is not None and temperature != 1.0:
-            warpers.append(TemperatureLogitsWarper(temperature))
-            
-        # Add top_p warper if applicable
-        top_p = generation_config.top_p
-        if top_p is not None and top_p < 1.0:
-            warpers.append(TopPLogitsWarper(top_p))
-        
-        # Add top_k warper if applicable
-        top_k = generation_config.top_k
-        if top_k is not None and top_k != 0:
-            warpers.append(TopKLogitsWarper(top_k))
-            
-        # Add min_p warper if applicable
-        min_p = getattr(generation_config, "min_p", None)
-        if min_p is not None and min_p > 0.0:
-            warpers.append(MinPLogitsWarper(min_p))
-            
-        # Add typical_p warper if applicable
-        typical_p = getattr(generation_config, "typical_p", None)
-        if typical_p is not None and 0.0 < typical_p < 1.0:
-            warpers.append(TypicalLogitsWarper(typical_p))
-            
-        return warpers
 
     @add_start_docstrings_to_model_forward(LLAMA_INPUTS_DOCSTRING)
     @replace_return_docstrings(

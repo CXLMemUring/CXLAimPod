@@ -232,22 +232,31 @@ class KLinearBase(ABC):
                     weight_scale_inv = self.gguf_loader.safetensor_loader.load_tensor(key+'.weight_scale_inv')
                     return nn.Parameter(tensor), nn.Parameter(weight_scale_inv)
                 return nn.Parameter(tensor)
+            else:
+                # For GGUF, need to translate the key with .weight suffix
+                from ktransformers.util.custom_gguf import translate_name_to_gguf
+                translated_key_with_weight = translate_name_to_gguf(key + ".weight")
+                # Remove .weight suffix after translation to get base key
+                if translated_key_with_weight.endswith(".weight"):
+                    translated_key = translated_key_with_weight[:-7]
+                else:
+                    translated_key = key
                 
-            elif key + ".weight" in self.gguf_loader.tensor_file_map:
-                if key + ".bias" in self.gguf_loader.tensor_file_map:
-                    tensors = self.load_multi(key, ["weight", "bias"], device=device)
+            if translated_key + ".weight" in self.gguf_loader.tensor_file_map:
+                if translated_key + ".bias" in self.gguf_loader.tensor_file_map:
+                    tensors = self.load_multi(translated_key, ["weight", "bias"], device=device)
                     tensor = tensors["weight"]
                     bias = tensors["bias"]
-                    # self.qtype = GGML_TYPE_QTYPE_MAP[tensorinfo[key + ".weight"]["ggml_type"]]
+                    # self.qtype = GGML_TYPE_QTYPE_MAP[tensorinfo[translated_key + ".weight"]["ggml_type"]]
                     # print(torch.isinf(tensor).any(), torch.isinf(bias).any())
                     return nn.Parameter(tensor), nn.Parameter(bias)
                 else:
-                    tensors = self.load_multi(key, ["weight"], device=device)
+                    tensors = self.load_multi(translated_key, ["weight"], device=device)
                     tensor = tensors["weight"]
-                    # self.qtype = GGML_TYPE_QTYPE_MAP[tensorinfo[key + ".weight"]["ggml_type"]]
+                    # self.qtype = GGML_TYPE_QTYPE_MAP[tensorinfo[translated_key + ".weight"]["ggml_type"]]
                     return nn.Parameter(tensor)
             else:
-                raise FileNotFoundError(f"Weight file not found for key {key}")
+                raise FileNotFoundError(f"Weight file not found for key {key} (translated: {translated_key})")
 
     def load_multi(self, key: str, keys: list[str], device: str = "cpu"):
         tensors = {}
@@ -594,7 +603,56 @@ class VLinearMarlin(KLinearBase):
 
         if isinstance(w, nn.Parameter):
             # pad weight
-            weight = w.view(self.orin_out_features, self.orin_in_features).T
+            print(f"[DEBUG] VLinearMarlin Weight tensor shape: {w.shape}, numel: {w.numel()}")
+            print(f"[DEBUG] Expected shape: ({self.orin_out_features}, {self.orin_in_features})")
+            print(f"[DEBUG] Expected size: {self.orin_out_features * self.orin_in_features}")
+            print(f"[DEBUG] Actual tensor dimensions: {list(w.shape)}")
+            print(f"[DEBUG] Is this quantized? num_bits={getattr(self, 'num_bits', 'N/A')}, group_size={getattr(self, 'group_size', 'N/A')}")
+            
+            # Check if the weight tensor size matches expected dimensions
+            expected_size = self.orin_out_features * self.orin_in_features
+            if w.numel() != expected_size:
+                # Check if tensor is already in correct shape
+                if len(w.shape) == 2:
+                    print(f"[DEBUG] Tensor already has 2D shape: {w.shape}")
+                    if w.shape[0] == self.orin_in_features and w.shape[1] == self.orin_out_features:
+                        print(f"[DEBUG] Using tensor as-is (already transposed)")
+                        weight = w
+                    elif w.shape[0] == self.orin_out_features and w.shape[1] == self.orin_in_features:
+                        print(f"[DEBUG] Transposing existing 2D tensor")
+                        weight = w.T
+                    else:
+                        # Try common quantized weight dimensions
+                        if w.shape[0] == 128000 and w.shape[1] == 1024:
+                            print(f"[DEBUG] Detected 128k x 1024 weight matrix, likely quantized")
+                            weight = w.T
+                        elif w.shape[0] == 32000 and w.shape[1] == 4096:
+                            print(f"[DEBUG] Detected 32k x 4096 weight matrix, using actual dimensions")
+                            # Update the dimensions to match the actual tensor
+                            self.orin_out_features = w.shape[0]
+                            self.orin_in_features = w.shape[1]
+                            weight = w.T
+                        else:
+                            print(f"[DEBUG] Unknown 2D shape, using tensor dimensions directly")
+                            # Use the actual tensor dimensions instead of forcing a reshape
+                            self.orin_out_features = w.shape[0]
+                            self.orin_in_features = w.shape[1]
+                            weight = w.T
+                else:
+                    # Try to infer correct dimensions
+                    if w.numel() % self.orin_in_features == 0:
+                        inferred_out = w.numel() // self.orin_in_features
+                        print(f"[DEBUG] Size mismatch! Inferring out_features={inferred_out} based on tensor size")
+                        weight = w.view(inferred_out, self.orin_in_features).T
+                    elif w.numel() % self.orin_out_features == 0:
+                        inferred_in = w.numel() // self.orin_out_features  
+                        print(f"[DEBUG] Size mismatch! Inferring in_features={inferred_in} based on tensor size")
+                        weight = w.view(self.orin_out_features, inferred_in).T
+                    else:
+                        print(f"[DEBUG] Cannot infer correct dimensions. Tensor size {w.numel()} is not divisible by either dimension")
+                        weight = w.view(self.orin_out_features, self.orin_in_features).T
+            else:
+                weight = w.view(self.orin_out_features, self.orin_in_features).T
             self.has_bias = False
         elif isinstance(w, tuple):
             w = list(w)
@@ -609,6 +667,9 @@ class VLinearMarlin(KLinearBase):
             self.bias = self.bias.to(device)
             
         if self.padding:
+            # Recalculate padding dimensions based on updated orin_in_features and orin_out_features
+            self.in_features = (self.orin_in_features+GPTQ_MARLIN_MIN_THREAD_K-1)//GPTQ_MARLIN_MIN_THREAD_K*GPTQ_MARLIN_MIN_THREAD_K
+            self.out_features = (self.orin_out_features+GPTQ_MARLIN_MIN_THREAD_N-1)//GPTQ_MARLIN_MIN_THREAD_N*GPTQ_MARLIN_MIN_THREAD_N
             padded_weight = torch.zeros(self.in_features, self.out_features, device=self.device)
             padded_weight[:self.orin_in_features, :self.orin_out_features] = weight
             weight = padded_weight
@@ -732,7 +793,56 @@ class KLinearMarlin(KLinearBase):
 
         if isinstance(w, nn.Parameter):
             # pad weight
-            weight = w.view(self.orin_out_features, self.orin_in_features).T
+            print(f"[DEBUG] KLinearMarlin Weight tensor shape: {w.shape}, numel: {w.numel()}")
+            print(f"[DEBUG] Expected shape: ({self.orin_out_features}, {self.orin_in_features})")
+            print(f"[DEBUG] Expected size: {self.orin_out_features * self.orin_in_features}")
+            print(f"[DEBUG] Actual tensor dimensions: {list(w.shape)}")
+            print(f"[DEBUG] Is this quantized? num_bits={getattr(self, 'num_bits', 'N/A')}, group_size={getattr(self, 'group_size', 'N/A')}")
+            
+            # Check if the weight tensor size matches expected dimensions
+            expected_size = self.orin_out_features * self.orin_in_features
+            if w.numel() != expected_size:
+                # Check if tensor is already in correct shape
+                if len(w.shape) == 2:
+                    print(f"[DEBUG] Tensor already has 2D shape: {w.shape}")
+                    if w.shape[0] == self.orin_in_features and w.shape[1] == self.orin_out_features:
+                        print(f"[DEBUG] Using tensor as-is (already transposed)")
+                        weight = w
+                    elif w.shape[0] == self.orin_out_features and w.shape[1] == self.orin_in_features:
+                        print(f"[DEBUG] Transposing existing 2D tensor")
+                        weight = w.T
+                    else:
+                        # Try common quantized weight dimensions
+                        if w.shape[0] == 128000 and w.shape[1] == 1024:
+                            print(f"[DEBUG] Detected 128k x 1024 weight matrix, likely quantized")
+                            weight = w.T
+                        elif w.shape[0] == 32000 and w.shape[1] == 4096:
+                            print(f"[DEBUG] Detected 32k x 4096 weight matrix, using actual dimensions")
+                            # Update the dimensions to match the actual tensor
+                            self.orin_out_features = w.shape[0]
+                            self.orin_in_features = w.shape[1]
+                            weight = w.T
+                        else:
+                            print(f"[DEBUG] Unknown 2D shape, using tensor dimensions directly")
+                            # Use the actual tensor dimensions instead of forcing a reshape
+                            self.orin_out_features = w.shape[0]
+                            self.orin_in_features = w.shape[1]
+                            weight = w.T
+                else:
+                    # Try to infer correct dimensions
+                    if w.numel() % self.orin_in_features == 0:
+                        inferred_out = w.numel() // self.orin_in_features
+                        print(f"[DEBUG] Size mismatch! Inferring out_features={inferred_out} based on tensor size")
+                        weight = w.view(inferred_out, self.orin_in_features).T
+                    elif w.numel() % self.orin_out_features == 0:
+                        inferred_in = w.numel() // self.orin_out_features  
+                        print(f"[DEBUG] Size mismatch! Inferring in_features={inferred_in} based on tensor size")
+                        weight = w.view(self.orin_out_features, inferred_in).T
+                    else:
+                        print(f"[DEBUG] Cannot infer correct dimensions. Tensor size {w.numel()} is not divisible by either dimension")
+                        weight = w.view(self.orin_out_features, self.orin_in_features).T
+            else:
+                weight = w.view(self.orin_out_features, self.orin_in_features).T
             self.has_bias = False
         elif isinstance(w, tuple):
             w = list(w)
@@ -747,6 +857,9 @@ class KLinearMarlin(KLinearBase):
             self.bias = self.bias.to(device)
             
         if self.padding:
+            # Recalculate padding dimensions based on updated orin_in_features and orin_out_features
+            self.in_features = (self.orin_in_features+GPTQ_MARLIN_MIN_THREAD_K-1)//GPTQ_MARLIN_MIN_THREAD_K*GPTQ_MARLIN_MIN_THREAD_K
+            self.out_features = (self.orin_out_features+GPTQ_MARLIN_MIN_THREAD_N-1)//GPTQ_MARLIN_MIN_THREAD_N*GPTQ_MARLIN_MIN_THREAD_N
             padded_weight = torch.zeros(self.in_features, self.out_features, device=self.device)
             padded_weight[:self.orin_in_features, :self.orin_out_features] = weight
             weight = padded_weight

@@ -1,6 +1,10 @@
 import argparse
 from ktransformers.server.backend.args import ConfigArgs, default_args
 from ktransformers.util.utils import get_free_ports
+from transformers import AutoConfig
+from ktransformers.models.configuration_qwen3_moe import Qwen3MoeConfig
+from ktransformers.models.configuration_smallthinker import SmallthinkerConfig
+from ktransformers.models.configuration_glm4_moe import Glm4MoeConfig
 
 class ArgumentParser:
     def __init__(self, cfg):
@@ -127,18 +131,31 @@ class ArgumentParser:
         else:
             args.model_dir = self.cfg.model_dir
             args.model_path = self.cfg.model_path
-        # set config from args
-        for key, value in vars(args).items():
-            if value is not None and hasattr(self.cfg, key):
-                setattr(self.cfg, key, value)
+        
         # we add the name not match args individually
         self.cfg.model_device = args.device
         self.cfg.mount_web = args.web
         self.cfg.server_ip = args.host
         self.cfg.server_port = args.port
         self.cfg.user_force_think = args.force_think
-        
-        args.gpu_memory_size = 4*1024*1024*1024 # TODO: set this to the actual GPU memory size
+        try:
+            model_config = AutoConfig.from_pretrained(args.model_dir, trust_remote_code=True)
+        except:
+            try:
+                model_config = Glm4MoeConfig.from_pretrained(args.model_dir, trust_remote_code=True)
+            except:
+                raise ValueError(f"Model {args.model_name} not supported. Please check your model directory or model name.")
+
+
+        if model_config.architectures[0] == "Qwen3MoeForCausalLM" or model_config.architectures[0] == "Qwen2MoeForCausalLM" or model_config.architectures[0] == "SmallThinkerForCausalLM" or model_config.architectures[0] == "Glm4MoeForCausalLM":
+            args.gpu_memory_size = args.cache_lens*2*2*model_config.num_hidden_layers*model_config.num_key_value_heads*model_config.head_dim
+            args.architectures = model_config.architectures[0]
+        else:
+            args.gpu_memory_size = args.cache_lens*2*576*61
+        # set config from args
+        for key, value in vars(args).items():
+            if value is not None and hasattr(self.cfg, key):
+                setattr(self.cfg, key, value)
         self.cfg.gpu_memory_size = args.gpu_memory_size
         free_ports = get_free_ports(3, [args.port])
         args.sched_port = free_ports[0]

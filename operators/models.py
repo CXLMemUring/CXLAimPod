@@ -53,10 +53,11 @@ from ktransformers.models.modeling_deepseek import (
     DeepseekV2DecoderLayer,
     DeepseekV2MoE,
 )
+from ktransformers.util.vendors import device_manager, get_device, to_device, GPUVendor
 from transformers.models.qwen2_moe.configuration_qwen2_moe import Qwen2MoeConfig
 from ktransformers.models.configuration_llama import LlamaConfig
 from ktransformers.operators.base_operator import BaseInjectedModule
-from ktransformers.util.utils import InferenceState
+from ktransformers.util.utils import InferenceState, get_compute_capability
 from ktransformers.util.custom_gguf import GGUFLoader
 from transformers.configuration_utils import PretrainedConfig
 from ktransformers.models.modeling_llama import (
@@ -305,6 +306,12 @@ class KQwen2MoeModel(BaseInjectedModule):
 
         hidden_states = inputs_embeds
 
+        # create position embeddings to be shared across the decoder layers
+        if torch.xpu.is_available() and inputs_embeds.device.type == "xpu":
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        else:
+            position_embeddings = None
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -313,31 +320,28 @@ class KQwen2MoeModel(BaseInjectedModule):
 
         for i, decoder_layer in enumerate(self.layers):
             if self.transfer_map is not None and i in self.transfer_map:
+                prev_stream = torch.cuda.current_stream()
                 cur_device = self.transfer_map[i]
-                if torch.cuda.is_available() and cur_device.lower() != "cpu":
-                    prev_stream = torch.cuda.current_stream()
-                    if cur_device not in self.stream_device_map:
-                        self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
-                    torch.cuda.set_device(cur_device)
-                    self.stream_device_map[cur_device].wait_stream(prev_stream)
-                    torch.cuda.set_stream(self.stream_device_map[cur_device])
-                # 如果无法使用CUDA，将设备设置为CPU
-                actual_device = cur_device if torch.cuda.is_available() and cur_device.lower() != "cpu" else "cpu" 
+                if cur_device not in self.stream_device_map:
+                    self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
+                torch.cuda.set_device(cur_device)
+                self.stream_device_map[cur_device].wait_stream(prev_stream)
+                torch.cuda.set_stream(self.stream_device_map[cur_device])
                 hidden_states = hidden_states.to(
-                    actual_device, non_blocking=torch.cuda.is_available()
+                    self.transfer_map[i], non_blocking=True
                 )
                 causal_mask = (
-                    causal_mask.to(actual_device, non_blocking=torch.cuda.is_available())
+                    causal_mask.to(self.transfer_map[i], non_blocking=True)
                     if causal_mask is not None
                     else None
                 )
                 position_ids = (
-                    position_ids.to(actual_device, non_blocking=torch.cuda.is_available())
+                    position_ids.to(self.transfer_map[i], non_blocking=True)
                     if position_ids is not None
                     else None
                 )
                 cache_position = (
-                    cache_position.to(actual_device, non_blocking=torch.cuda.is_available())
+                    cache_position.to(self.transfer_map[i], non_blocking=True)
                     if cache_position is not None
                     else None
                 )
@@ -360,46 +364,29 @@ class KQwen2MoeModel(BaseInjectedModule):
             else:
                 if per_layer_prefill_flag:
                     # print(f"to gpu")
-                    try:
-                        if torch.cuda.is_available():
-                            self.load_layer_to(decoder_layer, InferenceState.PREFILL)
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        else:
-                            # 如果没有CUDA，仍保持在CPU上
-                            pass
-                    except Exception as e:
-                        print(f"无法加载到GPU: {e}")
-                # 添加错误处理以应对attention中的NoneType错误
-                try:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        output_router_logits=output_router_logits,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                    )
-                except AttributeError as e:
-                    if "NoneType" in str(e):
-                        layer_outputs = (hidden_states, None, past_key_values)
-                    else:
-                        raise e
+                    self.load_layer_to(decoder_layer, InferenceState.PREFILL)
+                    torch.cuda.empty_cache()
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    output_router_logits=output_router_logits,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
                 if per_layer_prefill_flag:
                     # print(f"to cpu")
-                    try:
-                        self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
-                        if torch.cuda.is_available():
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                    except Exception as e:
-                        print(f"无法卸载层: {e}")
+                    self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
+                    torch.cuda.empty_cache()
             hidden_states = layer_outputs[0]
 
-            if use_cache:
+            if use_cache and len(layer_outputs) > 1:
                 next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+            else:
+                next_decoder_cache = None
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -418,11 +405,14 @@ class KQwen2MoeModel(BaseInjectedModule):
 
         next_cache = None
         if use_cache:
-            next_cache = (
-                next_decoder_cache.to_legacy_cache()
-                if use_legacy_cache
-                else next_decoder_cache
-            )
+            if next_decoder_cache is not None:
+                next_cache = (
+                    next_decoder_cache.to_legacy_cache()
+                    if use_legacy_cache
+                    else next_decoder_cache
+                )
+            else:
+                next_cache = past_key_values
 
         if not return_dict:
             return tuple(
@@ -604,8 +594,7 @@ class KDeepseekV2Model(BaseInjectedModule):
             per_layer_prefill_flag = True
             for layer in self.layers:
                 self.load_layer_to(layer, InferenceState.UNLOAD)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         else:
             pass
         output_attentions = (
@@ -652,12 +641,10 @@ class KDeepseekV2Model(BaseInjectedModule):
         
         if inputs_embeds is None:
             org_device = input_ids.device
-            # 确保所有内容在CPU上运行，而不是转回GPU
+            # TODO move to embed_tokens's device, not hard code to cpu
             input_ids = input_ids.to("cpu")
-            inputs_embeds = self.embed_tokens(input_ids)
-            # 不需要转回原始设备
-            # inputs_embeds = self.embed_tokens(input_ids).to(org_device)
-            # input_ids = input_ids.to(org_device)
+            inputs_embeds = self.embed_tokens(input_ids).to(org_device)
+            input_ids = input_ids.to(org_device)
 
         if cache_position is None:
             past_seen_tokens = (
@@ -672,12 +659,27 @@ class KDeepseekV2Model(BaseInjectedModule):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
+        if inputs_embeds.device.type == "xpu" and position_ids is not None:
+            cos, sin = self.layers[0].self_attn.rotary_emb(inputs_embeds,
+                                                           position_ids)
+            position_embeddings = (cos, sin)
+        else:
+            position_embeddings = None
+
         if per_layer_prefill_flag:
             causal_mask = None
         else:
-            causal_mask = self._update_causal_mask(
-                attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
-            )
+            if (os.name == 'nt'
+                or get_compute_capability() < 8
+                or (self.transfer_map is not None and 'cpu' in self.transfer_map.values())
+                or device_manager.gpu_vendor != GPUVendor.NVIDIA):
+                # print("for Windows or GPU before ampere, use forward_windows")
+                # only use mask in forward windows or can't flash attn
+                causal_mask = self._update_causal_mask(
+                    attention_mask, inputs_embeds, cache_position, past_key_values, output_attentions
+                )
+            else:
+                causal_mask = None
 
         # embed positions
         hidden_states = inputs_embeds
@@ -694,32 +696,31 @@ class KDeepseekV2Model(BaseInjectedModule):
         t_f = 0
 
         for i, decoder_layer in enumerate(self.layers):
+            # print(f"@@@@@@@@@@@@@@@@@layer {i}@@@@@@@@@@@@@@@@@@@@ \n")
             if self.transfer_map is not None and i in self.transfer_map:
+                prev_stream = torch.cuda.current_stream()
                 cur_device = self.transfer_map[i]
-                if torch.cuda.is_available() and cur_device.lower() != "cpu":
-                    prev_stream = torch.cuda.current_stream()
-                    if cur_device not in self.stream_device_map:
-                        self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
+                if cur_device not in self.stream_device_map and cur_device.lower() != "cpu":
+                    self.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
+                if cur_device.lower() != "cpu":
                     torch.cuda.set_device(cur_device)
                     self.stream_device_map[cur_device].wait_stream(prev_stream)
                     torch.cuda.set_stream(self.stream_device_map[cur_device])
-                # 如果无法使用CUDA，将设备设置为CPU
-                actual_device = cur_device if torch.cuda.is_available() and cur_device.lower() != "cpu" else "cpu" 
                 hidden_states = hidden_states.to(
-                    actual_device, non_blocking=torch.cuda.is_available()
+                    self.transfer_map[i], non_blocking=True
                 )
                 causal_mask = (
-                    causal_mask.to(actual_device, non_blocking=torch.cuda.is_available())
+                    causal_mask.to(self.transfer_map[i], non_blocking=True)
                     if causal_mask is not None
                     else None
                 )
                 position_ids = (
-                    position_ids.to(actual_device, non_blocking=torch.cuda.is_available())
+                    position_ids.to(self.transfer_map[i], non_blocking=True)
                     if position_ids is not None
                     else None
                 )
                 cache_position = (
-                    cache_position.to(actual_device, non_blocking=torch.cuda.is_available())
+                    cache_position.to(self.transfer_map[i], non_blocking=True)
                     if cache_position is not None
                     else None
                 )
@@ -742,16 +743,8 @@ class KDeepseekV2Model(BaseInjectedModule):
                 t3 = time.time()
                 if per_layer_prefill_flag:
                     # print(f"to gpu")
-                    try:
-                        if torch.cuda.is_available():
-                            self.load_layer_to(decoder_layer, InferenceState.PREFILL)
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                        else:
-                            # 如果没有CUDA，仍保持在CPU上
-                            pass
-                    except Exception as e:
-                        print(f"无法加载到GPU: {e}")
+                    self.load_layer_to(decoder_layer, InferenceState.PREFILL)
+                    torch.cuda.empty_cache()
                 t4 = time.time()
                 # with open("log.txt", "a") as f:
                 #     f.write(f"@@@@@@@@@@@@@@@@@layer {i}@@@@@@@@@@@@@@@@@@@@ \n")
@@ -763,17 +756,13 @@ class KDeepseekV2Model(BaseInjectedModule):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings,
                 )
                 t5 = time.time()
                 if per_layer_prefill_flag:
                     # print(f"to cpu")
-                    try:
-                        self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
-                        if torch.cuda.is_available():
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                    except Exception as e:
-                        print(f"无法卸载层: {e}")
+                    self.load_layer_to(decoder_layer, InferenceState.UNLOAD)
+                    torch.cuda.empty_cache()
                 t6 = time.time()
             t_gpu += t4 - t3
             t_cpu += t6 - t5
@@ -800,8 +789,7 @@ class KDeepseekV2Model(BaseInjectedModule):
             per_layer_prefill_flag = False
             for layer in self.layers:
                 self.load_layer_to(layer, InferenceState.GENERATE)
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
             t7 = time.time()
 
             print(
@@ -1015,53 +1003,8 @@ class KLlamaModel(BaseInjectedModule):
         config_path: str = os.path.join(localstore_path,Config.CONFIG_FILE_NAME)
         with open(config_path,"r") as file:
             config_yaml = yaml.safe_load(file.read())
-            self.long_context_config = config_yaml.get("long_context", {})
-            self.ext_config = config_yaml.get("ext", {})
-            
-            # 确保所有必需的键都有默认值
-            if "chunk_size" not in self.long_context_config:
-                print("Warning: 'chunk_size' not found in long_context_config, using default value of 16384")
-                self.long_context_config["chunk_size"] = 16384
-                
-            # 其他可能需要默认值的键
-            defaults = {
-                "max_seq_len": 32768,
-                "block_size": 128,
-                "local_windows_len": 256,
-                "second_select_num": 128,
-                "anchor_type": "token",
-                "kv_type": "FP16",
-                "dense_layer_num": 1,
-                "anchor_num": 128,
-                "preselect_block": True,
-                "head_select_mode": "count",
-                "preselect_block_count": 96,
-                "layer_step": 3,
-                "token_step": 0,
-            }
-            
-            # 设置默认值
-            for key, value in defaults.items():
-                if key not in self.long_context_config:
-                    print(f"Warning: '{key}' not found in long_context_config, using default value: {value}")
-                    self.long_context_config[key] = value
-                    
-            # 确保ext_config也有必需的键
-            if "cpu_infer" not in self.ext_config:
-                print("Warning: 'cpu_infer' not found in ext_config, using default value of 1")
-                self.ext_config["cpu_infer"] = 1
-                
-            # 确保数字类型的参数是整数
-            for key in ["max_seq_len", "block_size", "local_windows_len", "second_select_num", 
-                        "dense_layer_num", "anchor_num", "preselect_block_count", "layer_step", 
-                        "token_step", "chunk_size", "cpu_infer"]:
-                if key in self.long_context_config:
-                    try:
-                        self.long_context_config[key] = int(self.long_context_config[key])
-                    except (TypeError, ValueError):
-                        default = defaults.get(key, 0)
-                        print(f"Warning: '{key}' value is not a valid integer, using default: {default}")
-                        self.long_context_config[key] = default
+            self.long_context_config = config_yaml.get("long_context")
+            self.ext_config = config_yaml.get("ext")
 
         KLlamaModel.dynamic_sdpa = DynamicScaledDotProductAttention(
             max_seq_len=self.long_context_config["max_seq_len"],
@@ -1079,7 +1022,7 @@ class KLlamaModel(BaseInjectedModule):
             block_selection_mode=self.long_context_config["head_select_mode"],
             preselect_block_count=self.long_context_config["preselect_block_count"],
             layer_step=self.long_context_config["layer_step"],
-            token_step=0 if self.long_context_config["token_step"] is None else self.long_context_config["token_step"],
+            token_step=self.long_context_config["token_step"],
             prefill_chunk_size=self.long_context_config["chunk_size"],
             use_attn_sparsity=False,
         )
@@ -1176,8 +1119,7 @@ class KLlamaModel(BaseInjectedModule):
                 return_dict,
             )
         elif q_len <= chunck_size:
-            # 移除GPU转移，保持在CPU上
-            # inputs_embeds = inputs_embeds.to('cuda')
+            inputs_embeds = inputs_embeds.to('cuda')
             output = self.forward_chunk(
                 inputs_embeds,
                 causal_mask,
@@ -1216,15 +1158,9 @@ class KLlamaModel(BaseInjectedModule):
                 cache_position[cur_idx : min(cur_idx + chunck_size, q_len)],
             )
             cur_output = output_with_past.last_hidden_state
-            # 确保remaining_length不会变为负数
-            old_remaining_length = KLlamaModel.dynamic_sdpa.remaining_length
             KLlamaModel.dynamic_sdpa.remaining_length -= (
-                    min(inputs_embeds.size(1), KLlamaModel.dynamic_sdpa.prefill_chunk_size)
+                min(cur_idx + chunck_size, q_len) - cur_idx
             )
-            # 安全检查，避免negative value
-            if KLlamaModel.dynamic_sdpa.remaining_length < 0:
-                print(f"Warning: dynamic_sdpa.remaining_length became negative ({KLlamaModel.dynamic_sdpa.remaining_length}), resetting to 0")
-                KLlamaModel.dynamic_sdpa.remaining_length = 0
             cur_idx += chunck_size
             # if attn_output is None:
             attn_output = cur_output
@@ -1294,23 +1230,16 @@ class KLlamaModel(BaseInjectedModule):
                     position_embeddings,
                 )
             else:
-                # 添加错误处理以应对attention中的NoneType错误
-                try:
-                    layer_outputs = decoder_layer(
-                        hidden_states,
-                        attention_mask=causal_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
-                        position_embeddings=position_embeddings,
-                    )
-                except AttributeError as e:
-                    if "NoneType" in str(e):
-                        layer_outputs = (hidden_states, None, past_key_values)
-                    else:
-                        raise e
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                )
 
             hidden_states = layer_outputs[0]
 

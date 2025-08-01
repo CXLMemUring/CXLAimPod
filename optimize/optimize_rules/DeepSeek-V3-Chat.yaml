@@ -52,7 +52,6 @@
       generate_device: "cpu"
       generate_op: "KExpertsCPU"
       out_device: "cpu"
-      backend: "AMXDynamicInt8" # or "AMXBF16" or "llamafile" (default)
   recursive: False # don't recursively inject submodules of this module
 - match:
     name: "^model\\.layers\\..*\\.self_attn$"

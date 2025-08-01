@@ -181,6 +181,17 @@ class GGUFLoader:
     tensor_file_map: dict # {tensor_name: tensor_file_path}
     gguf_file_meta: dict
     safetensor_loader: SafeTensorLoader
+    def has_tensor(self, name: str) -> bool:
+        """Check if a tensor exists in the loaded GGUF files"""
+        return name in self.tensor_info or name in self.tensor_file_map
+    
+    def get_ggml_type(self, name: str) -> int:
+        """Get the GGML type of a tensor"""
+        if name in self.tensor_info:
+            return self.tensor_info[name]["ggml_type"]
+        else:
+            raise KeyError(f"Tensor {name} not found in tensor_info")
+    
     def __init__(self, gguf_path: str):
         # Check dir exist
         if not os.path.exists(gguf_path):
@@ -686,7 +697,7 @@ def dequantize_q6_k_gpu(data: np.ndarray, device:str = "cpu", target_dtype = tor
     
     # Use CUDA implementation for CUDA devices
     device_obj = torch.device(device)
-    if device_obj.type == "cuda":
+    if device_obj.type == "cpu":
         c_pointer = ctypes.addressof(ctypes.cast(data.ctypes.data, ctypes.POINTER(ctypes.c_int8)).contents)
         return KTransformersOps.dequantize_q6_k(c_pointer, data.size, block_size, ele_per_blk, device, target_dtype)
     

@@ -6,7 +6,7 @@
 echo "Setting up optimized CPU environment for KTransformers..."
 
 # Get number of CPU cores
-NUM_CORES=33
+NUM_CORES=86
 echo "Detected $NUM_CORES CPU cores"
 
 # Set optimal environment variables for CPU inference
@@ -57,14 +57,14 @@ OPTIMIZE_CONFIG="${OPTIMIZE_CONFIG:-optimize/optimize_rules/DeepSeek-V3-Chat-amx
 MAX_TOKENS="${MAX_TOKENS:-10}"
 
 # Run with optimized script
-echo python optimized_local_chat.py \
+echo python local_chat.py \
     --model_path="$MODEL_PATH" \
     --gguf_path="$GGUF_PATH" \
     --optimize_config_path="$OPTIMIZE_CONFIG" \
     --max_new_tokens=$MAX_TOKENS \
     --cpu_infer=$NUM_CORES \
     "$@"
-python optimized_local_chat.py \
+python local_chat.py \
     --model_path="$MODEL_PATH" \
     --gguf_path="$GGUF_PATH" \
     --optimize_config_path="$OPTIMIZE_CONFIG" \

@@ -16,25 +16,26 @@ import torch.utils.checkpoint
 from torch import nn
 from ktransformers.server.balance_serve.inference.forward_batch import ForwardBatchInput, ForwardBatchOutput
 from ktransformers.models.custom_cache import KGQACache
-from ktransformers.models.modeling_qwen2_moe import Qwen2MoeModel, Qwen2MoePreTrainedModel
-from ktransformers.models.configuration_qwen2_moe import Qwen2MoeConfig
+from ktransformers.models.modeling_glm4_moe import Glm4MoeModel,  Glm4MoePreTrainedModel
+from ktransformers.models.configuration_glm4_moe import Glm4MoeConfig
 from ktransformers.operators.flashinfer_batch_prefill_wrapper import flashInferAttn
 
 torch.set_grad_enabled(False)
 torch.set_default_dtype(torch.bfloat16)
 import flashinfer
 
-class KQwen2MoeForCausalLM(Qwen2MoePreTrainedModel):
+class KGlm4MoeForCausalLM(Glm4MoePreTrainedModel):
 
     cache: KGQACache
     use_cuda_graph = False
     def __init__(
         self,
-        config: Qwen2MoeConfig,
+        config: Glm4MoeConfig,
         cache,
     ):
+
         super().__init__(config)
-        self.model = Qwen2MoeModel(config)
+        self.model = Glm4MoeModel(config)
         self.config = config
         self.cache = cache
         self.vocab_size = config.vocab_size
@@ -77,37 +78,27 @@ class KQwen2MoeForCausalLM(Qwen2MoePreTrainedModel):
         hidden_states = features[0]
         self.attn[cuda_graph_idx].calc_batch_indices(hidden_states.shape[0])
 
+        freqs_cis = self.model.rotary_emb(hidden_states.unsqueeze(0), batch.minibatch.position_ids.unsqueeze(0))
+
+
         with torch.cuda.stream(current_stream):
             residual = torch.zeros_like(hidden_states)
             for i, decode_layer in enumerate(self.model.layers):
-                if self.model.transfer_map is not None and i in self.model.transfer_map:
-                    prev_stream = torch.cuda.current_stream()
-                    cur_device = self.model.transfer_map[i]
-                    if cur_device not in self.model.stream_device_map:
-                        self.model.stream_device_map[cur_device] = torch.cuda.Stream(cur_device)
-                    torch.cuda.set_device(cur_device)
-                    self.model.stream_device_map[cur_device].wait_stream(prev_stream)
-                    torch.cuda.set_stream(self.model.stream_device_map[cur_device])
-                    hidden_states = hidden_states.to(
-                        self.model.transfer_map[i], non_blocking=True
-                    )
 
-                    batch.minibatch.position_ids = (
-                        batch.minibatch.position_ids.to(self.model.transfer_map[i], non_blocking=True)
-                        if batch.minibatch.position_ids is not None
-                        else None
-                    )
                 hidden_states, residual = decode_layer.input_layernorm(hidden_states, num_tokens_tensors, residual)
                 hidden_states = decode_layer.self_attn(hidden_states, self.cache, 
-                                                       position_ids=batch.minibatch.position_ids, 
+                                                       freqs_cis,
                                                        wrapper=self.attn[cuda_graph_idx], bsz_tensors=num_tokens_tensors, 
-                                                       page_idx=page_idx,
-                                                       page_offset=page_offset
+                                                       position_ids=batch.minibatch.position_ids
                                                        )
 
                 hidden_states, residual = decode_layer.post_attention_layernorm(hidden_states, num_tokens_tensors, residual)
-                hidden_states = decode_layer.mlp(hidden_states.unsqueeze(0), num_tokens_tensors, cuda_graph_idx)
-                hidden_states = hidden_states.squeeze(0)
+                if i < self.model.config.first_k_dense_replace:
+                    hidden_states = decode_layer.mlp(hidden_states, num_tokens_tensors)
+                else:
+                    hidden_states = decode_layer.mlp(hidden_states, num_tokens_tensors, cuda_graph_idx)
+                    # hidden_states = hidden_states.squeeze(0)
+
         forward_batch_output = ForwardBatchOutput()
         with torch.cuda.stream(current_stream):
             local_logit = self.lm_head(self.model.norm(hidden_states, num_tokens_tensors, residual)[0], num_tokens_tensors)
@@ -129,5 +120,5 @@ class KQwen2MoeForCausalLM(Qwen2MoePreTrainedModel):
         ):
         minibatch = batch.minibatch
         self.attn[cuda_graph_idx].plan(minibatch.q_indptr, minibatch.kv_indptr, minibatch.kv_indices, 
-                          minibatch.kv_last_page_len, bsz_tensors, num_tokens_tensors,num_q_heads, num_kv_heads, head_dim, page_size, causal=causal, q_data_type=q_data_type, kv_data_type=kv_data_type)
+                          minibatch.kv_last_page_len, bsz_tensors, num_tokens_tensors, num_q_heads, num_kv_heads, head_dim, page_size, causal=causal, q_data_type=q_data_type, kv_data_type=kv_data_type)
         

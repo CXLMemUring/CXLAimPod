@@ -17,21 +17,19 @@ import logging
 logger = logging.getLogger("dynamic_attention")
 sys.path.append(os.path.dirname(__file__) + "/../ktransformers_ext/cpu_backend")
 from ktransformers.operators.cpuinfer import CPUInfer, CPUInferKVCache
-from flash_attn import flash_attn_func, flash_attn_with_kvcache
+try:
+    from flash_attn import flash_attn_func, flash_attn_with_kvcache
+except:
+    print("falsh attn not found")
 
 
 import math
 import json
 
-# 环境配置（在文件开头或初始化时添加）
-import os
-os.environ["ONEDNN_MAX_CPU_ISA"] = "AVX512_CORE_AMX"
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
-os.environ["ONEDNN_PRIMITIVE_CACHE_CAPACITY"] = "1024"
-torch.backends.mkldnn.enabled = True
 
 class DynamicScaledDotProductAttention:
     remaining_length: int
+    cpu_infer = None
 
     def __init__(
         self,
@@ -43,7 +41,7 @@ class DynamicScaledDotProductAttention:
         topk: int,
         threads_num: int,
         anchor_type: str = "DYNAMIC",
-        kv_type: str = "Q8_0",
+        kv_type: str = "FP16",
         dense_layer_num: int = 0,
         anchor_num: int = 1,
         block_selection_mode: str = "SHARED",
@@ -117,9 +115,6 @@ class DynamicScaledDotProductAttention:
             dtype=torch.float16,
         )
 
-        # 检查CUDA是否可用，仅在可用时使用pin_memory
-        use_pin_memory = torch.cuda.is_available()
-        
         # key_states: [bsz, q_len, kv_head_num, head_dim]
         # value_states: [bsz, q_len, kv_head_num, head_dim]
         # query_states: [bsz, q_len, q_head_num, head_dim]
@@ -127,33 +122,33 @@ class DynamicScaledDotProductAttention:
             (1, 1, self.q_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=use_pin_memory,
+            pin_memory=True,
         )
         self.k_in_cpu = torch.zeros(
             (1, 1, self.kv_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=use_pin_memory,
+            pin_memory=True,
         )
         self.v_in_cpu = torch.zeros(
             (1, 1, self.kv_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=use_pin_memory,
+            pin_memory=True,
         )
 
         self.cache_seqlens_cpu = torch.empty(
-            (1,), device="cpu", dtype=torch.int32, pin_memory=use_pin_memory
+            (1,), device="cpu", dtype=torch.int32, pin_memory=True
         )
 
         self.cache_seqlens_cuda = torch.empty((1,), device=device, dtype=torch.int32)
 
         self.prefix_block_table = torch.arange(
-            self.block_num, device="cpu", dtype=torch.int32, pin_memory=use_pin_memory
+            self.block_num, device="cpu", dtype=torch.int32, pin_memory=True
         ).view(1, -1)
 
         self.block_table_cpu = torch.arange(
-            self.block_num, device="cpu", dtype=torch.int32, pin_memory=use_pin_memory
+            self.block_num, device="cpu", dtype=torch.int32, pin_memory=True
         ).view(1, -1)
 
         # assert (
@@ -165,10 +160,10 @@ class DynamicScaledDotProductAttention:
             (1, 1, self.q_head_num, self.head_dim),
             device="cpu",
             dtype=torch.float16,
-            pin_memory=use_pin_memory,
+            pin_memory=True,
         )
         self.lse_cpu = torch.empty(
-            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=use_pin_memory
+            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=True
         )
 
         self.output_cuda = torch.empty(
@@ -176,7 +171,7 @@ class DynamicScaledDotProductAttention:
         )
 
         self.attn_sparsity = torch.zeros(
-            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=use_pin_memory
+            (1, 1, self.q_head_num), device="cpu", dtype=torch.float32, pin_memory=True
         )
 
         if preselect_block == True:
@@ -189,7 +184,9 @@ class DynamicScaledDotProductAttention:
             self.preselect_block_num = 0  # block_num before preselect
             self.evict_tokens = 0
 
-        self.cpu_infer = CPUInfer(threads_num)
+        if DynamicScaledDotProductAttention.cpu_infer is None:
+            DynamicScaledDotProductAttention.cpu_infer = CPUInfer(threads_num)
+            self.cpu_infer = DynamicScaledDotProductAttention.cpu_infer
         self.local_thread = CPUInferKVCache(
             self.layer_num,
             self.kv_head_num,
@@ -201,7 +198,7 @@ class DynamicScaledDotProductAttention:
             kv_type=self.kv_type,
             retrieval_type=self.block_selection_mode,
             layer_step=self.layer_step,
-            token_step=0 if self.token_step is None else self.token_step,
+            token_step=self.token_step,
             layer_offset=self.dense_layer_num % self.layer_step,
             max_batch_size=1,
             max_block_num=self.block_num,
@@ -346,11 +343,8 @@ class DynamicScaledDotProductAttention:
             importance_cache = self.cache_importance.narrow(
                 0, 0, max_block_num * batch_size
             ).view(batch_size, max_block_num * self.block_size, self.q_head_num)
-            
-            # 检查CUDA是否可用，仅在可用时使用pin_memory
-            use_pin_memory = torch.cuda.is_available()
             importance_cache_cpu = torch.empty_like(
-                importance_cache, device="cpu", pin_memory=use_pin_memory
+                importance_cache, device="cpu", pin_memory=True
             )
 
             importance_cache_cpu.copy_(importance_cache)
@@ -358,44 +352,22 @@ class DynamicScaledDotProductAttention:
             block_table_cpu = self.prefix_block_table[:, :max_block_num].to("cpu")
             offset_cpu = offset.contiguous().to("cpu")
 
-            if torch.cuda.is_available():
-                self.cpu_infer.submit_with_cuda_stream(
-                    torch.cuda.current_stream().cuda_stream,
-                    self.local_thread.update_importance(
-                        importance_cache_cpu,
-                        layer_idx,
-                        block_table_cpu,
-                        max_block_num,
-                        offset_cpu,
-                        width,
-                    ),
+            self.cpu_infer.submit(
+                self.local_thread.update_importance(
+                    importance_cache_cpu,
+                    layer_idx,
+                    block_table_cpu,
+                    max_block_num,
+                    offset_cpu,
+                    width,
                 )
-            else:
-                self.cpu_infer.submit(
-                    self.local_thread.update_importance(
-                        importance_cache_cpu,
-                        layer_idx,
-                        block_table_cpu,
-                        max_block_num,
-                        offset_cpu,
-                        width,
-                    )
-                )
-            
-            if torch.cuda.is_available():
-                self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
-            else:
-                self.cpu_infer.sync()
+            )
+            self.cpu_infer.sync()
 
         importance_cache = self.cache_importance.narrow(
             0, 0, max_block_num * batch_size
         ).view(batch_size, max_block_num * self.block_size, self.q_head_num)
-        
-        # 检查CUDA是否可用，仅在可用时使用pin_memory
-        use_pin_memory = torch.cuda.is_available()
-        importance_cache_cpu = torch.empty_like(
-            importance_cache, device="cpu", pin_memory=use_pin_memory
-        )
+        importance_cache.zero_()
 
     # key: [bsz, past_len, head_num, head_dim] float16
     # query: [bsz, q_len, q_head_num, head_dim] float16
@@ -468,11 +440,8 @@ class DynamicScaledDotProductAttention:
         importance_cache = self.cache_importance.narrow(
             0, 0, max_block_num * batch_size
         ).view(batch_size, max_block_num * self.block_size, self.q_head_num)
-        
-        # 检查CUDA是否可用，仅在可用时使用pin_memory
-        use_pin_memory = torch.cuda.is_available()
         importance_cache_cpu = torch.empty_like(
-            importance_cache, device="cpu", pin_memory=use_pin_memory
+            importance_cache, device="cpu", pin_memory=True
         )
 
         importance_cache_cpu.copy_(importance_cache)
@@ -480,34 +449,17 @@ class DynamicScaledDotProductAttention:
         block_table_cpu = self.prefix_block_table[:, :max_block_num].to("cpu")
         offset_cpu = offset.contiguous().to("cpu")
 
-        if torch.cuda.is_available():
-            self.cpu_infer.submit_with_cuda_stream(
-                torch.cuda.current_stream().cuda_stream,
-                self.local_thread.update_importance(
-                    importance_cache_cpu,
-                    layer_idx,
-                    block_table_cpu,
-                    max_block_num,
-                    offset_cpu,
-                    width,
-                ),
+        self.cpu_infer.submit(
+            self.local_thread.update_importance(
+                importance_cache_cpu,
+                layer_idx,
+                block_table_cpu,
+                max_block_num,
+                offset_cpu,
+                width,
             )
-        else:
-            self.cpu_infer.submit(
-                self.local_thread.update_importance(
-                    importance_cache_cpu,
-                    layer_idx,
-                    block_table_cpu,
-                    max_block_num,
-                    offset_cpu,
-                    width,
-                )
-            )
-        
-        if torch.cuda.is_available():
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
-        else:
-            self.cpu_infer.sync()
+        )
+        self.cpu_infer.sync()
         importance_cache.zero_()
 
     # key: [bsz, q_len, head_num, head_dim] float16
@@ -533,16 +485,11 @@ class DynamicScaledDotProductAttention:
                 value[batch_idx].view(-1, self.kv_head_num, self.head_dim)
             )
 
-        # 检查CUDA是否可用，仅在可用时使用pin_memory
-        use_pin_memory = torch.cuda.is_available()
-        k_cache_cpu = torch.empty_like(k_cache, device="cpu", pin_memory=use_pin_memory)
-        v_cache_cpu = torch.empty_like(v_cache, device="cpu", pin_memory=use_pin_memory)
+        k_cache_cpu = torch.empty_like(k_cache, device="cpu", pin_memory=True)
+        v_cache_cpu = torch.empty_like(v_cache, device="cpu", pin_memory=True)
 
-        # 判断是否可以使用non_blocking
-        use_non_blocking = torch.cuda.is_available()
-        
-        k_cache_cpu.copy_(k_cache, non_blocking=use_non_blocking)
-        v_cache_cpu.copy_(v_cache, non_blocking=use_non_blocking)
+        k_cache_cpu.copy_(k_cache)
+        v_cache_cpu.copy_(v_cache)
 
         cur_block_num = (
             q_len + past_len[0].item() + self.block_size - 1
@@ -550,43 +497,21 @@ class DynamicScaledDotProductAttention:
         block_table_cpu = self.prefix_block_table[:, :cur_block_num].to("cpu")
         past_len_cpu = past_len.contiguous().to("cpu")
 
-        if torch.cuda.is_available():
-            self.cpu_infer.submit_with_cuda_stream(
-                torch.cuda.current_stream().cuda_stream,
-                self.local_thread.get_and_update_kvcache_fp16(
-                    k_cache_cpu,
-                    v_cache_cpu,
-                    layer_idx,
-                    block_table_cpu,
-                    max_block_num,
-                    past_len_cpu,
-                    q_len,
-                ),
+        self.cpu_infer.submit(
+            self.local_thread.get_and_update_kvcache_fp16(
+                k_cache_cpu,
+                v_cache_cpu,
+                layer_idx,
+                block_table_cpu,
+                max_block_num,
+                past_len_cpu,
+                q_len,
             )
-        else:
-            self.cpu_infer.submit(
-                self.local_thread.get_and_update_kvcache_fp16(
-                    k_cache_cpu,
-                    v_cache_cpu,
-                    layer_idx,
-                    block_table_cpu,
-                    max_block_num,
-                    past_len_cpu,
-                    q_len,
-                )
-            )
+        )
 
-        if torch.cuda.is_available():
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
-        else:
-            self.cpu_infer.sync()
-
+        self.cpu_infer.sync()
         k_cache.copy_(k_cache_cpu)
         v_cache.copy_(v_cache_cpu)
-
-        # 强制内存连续
-        k_cache = k_cache.contiguous()
-        v_cache = v_cache.contiguous()
 
         return k_cache, v_cache
 
@@ -597,55 +522,29 @@ class DynamicScaledDotProductAttention:
             [cache_seqlens], device="cpu", dtype=torch.int32
         )
 
-        if torch.cuda.is_available():
-            self.cpu_infer.submit_with_cuda_stream(
-                torch.cuda.current_stream().cuda_stream,
-                self.local_thread.calc_anchor_all_layers(
-                    block_table_cpu,
-                    cache_seqlens_cpu,
-                ),
+        self.cpu_infer.submit(
+            self.local_thread.calc_anchor_all_layers(
+                block_table_cpu,
+                cache_seqlens_cpu,
             )
-        else:
-            self.cpu_infer.submit(
-                self.local_thread.calc_anchor_all_layers(
-                    block_table_cpu,
-                    cache_seqlens_cpu,
-                )
-            )
-
-        if torch.cuda.is_available():
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
-        else:
-            self.cpu_infer.sync()
+        )
+        self.cpu_infer.sync()
 
     def clear_importance(self, cache_seqlens: int):
-        # print(f"clear importance: {cache_seqlens}")
+        print(f"clear importance: {cache_seqlens}")
         cur_block_num = (cache_seqlens + self.block_size - 1) // self.block_size
         block_table_cpu = self.prefix_block_table[:, :cur_block_num].to("cpu")
         cache_seqlens_cpu = torch.tensor(
             [cache_seqlens], device="cpu", dtype=torch.int32
         )
 
-        if torch.cuda.is_available():
-            self.cpu_infer.submit_with_cuda_stream(
-                torch.cuda.current_stream().cuda_stream,
-                self.local_thread.clear_importance_all_layers(
-                    block_table_cpu,
-                    cache_seqlens_cpu,
-                ),
+        self.cpu_infer.submit(
+            self.local_thread.clear_importance_all_layers(
+                block_table_cpu,
+                cache_seqlens_cpu,
             )
-        else:
-            self.cpu_infer.submit(
-                self.local_thread.clear_importance_all_layers(
-                    block_table_cpu,
-                    cache_seqlens_cpu,
-                )
-            )
-
-        if torch.cuda.is_available():
-            self.cpu_infer.sync_with_cuda_stream(torch.cuda.current_stream().cuda_stream)
-        else:
-            self.cpu_infer.sync()
+        )
+        self.cpu_infer.sync()
 
     def clear_kvcache(self, cache_seqlens: int):
         cur_block_num = (cache_seqlens + self.block_size - 1) // self.block_size
@@ -718,6 +617,10 @@ class DynamicScaledDotProductAttention:
         # key_states: [bsz, q_len, kv_head_num, head_dim]
         # value_states: [bsz, q_len, kv_head_num, head_dim]
         # query_states: [bsz, q_len, q_head_num, head_dim]
+        assert query_states.dtype == torch.float16
+        assert key_states.dtype == torch.float16
+        assert value_states.dtype == torch.float16
+
         assert key_states.size(2) == self.kv_head_num
         assert value_states.size(2) == self.kv_head_num
         assert query_states.size(2) == self.q_head_num
@@ -753,109 +656,46 @@ class DynamicScaledDotProductAttention:
                     query_states,
                     key,
                 )
-
-            # 使用AMX优化的批处理矩阵乘法
-            n_gqa = self.q_head_num // self.kv_head_num
-            
-            # 重塑张量以利用AMX的tile计算
-            query = query_states.view(bsz, q_len, self.kv_head_num, n_gqa, self.head_dim)  # [bsz, q_len, kv, gqa, d]
-            key = key.permute(0, 2, 1, 3)  # [bsz, kv, seq_len, d]
-            value = value.permute(0, 2, 1, 3)  # [bsz, kv, seq_len, d]
-
-            # 获取实际序列长度
-            seq_len = key.size(2)  # 关键修改：使用key的实际序列长度
-            
-            # 创建4D因果mask (添加kv_head和gqa维度)
-            mask = torch.tril(torch.ones(
-                q_len, 
-                seq_len, 
-                dtype=torch.bool, 
-                device=device
-            )).view(1, q_len, 1, 1, seq_len)  # [1, q_len, 1, 1, seq_len]
-
-            # 使用内存连续格式
-            query = query.contiguous().to(torch.bfloat16)
-            key = key.contiguous().to(torch.bfloat16)
-            
-            # 批处理矩阵乘法
-            scores = torch.einsum('bqkgd,bksd->bqkgs', 
-                        query, 
-                        key) / math.sqrt(self.head_dim)
-            
-            # 扩展scores维度以匹配mask
-            scores = scores.view(bsz, q_len, self.kv_head_num, n_gqa, seq_len)
-            
-            # 应用mask（确保维度对齐）
-            scores = scores.masked_fill(~mask, -10000.0)
-
-            # 批处理softmax
-            attn_weights = torch.nn.functional.softmax(scores, dim=-1)
-            
-            # 使用AMX加速的矩阵乘法
-            with torch.backends.mkldnn.verbose(torch.backends.mkldnn.VERBOSE_ON):
-                context = torch.einsum('bqkgs,bksd->bqkgd', 
-                             attn_weights.to(torch.bfloat16),
-                             value.to(torch.bfloat16))
-            
-            # 重塑回原始形状（修复内存连续性）
-            context = context.contiguous()  # 添加连续性保证
-            attn_output = context.view(
-                bsz, 
-                q_len, 
-                self.q_head_num, 
-                self.head_dim
+            output = flash_attn_with_kvcache(
+                q=query_states,
+                k_cache=key,
+                v_cache=value,
+                cache_seqlens=self.cache_seqlens_cuda + q_len,
+                causal=True,
             )
-            
-            return attn_output.transpose(1, 2)
+            return output.transpose(1, 2)
 
         elif mode == "generate":
             assert self.generate_token_idx >= 0
-            # 判断是否可以使用non_blocking
-            use_non_blocking = torch.cuda.is_available()
-            
-            self.q_in_cpu.copy_(query_states, non_blocking=use_non_blocking)
-            self.k_in_cpu.copy_(key_states, non_blocking=use_non_blocking)
-            self.v_in_cpu.copy_(value_states, non_blocking=use_non_blocking)
-            self.cache_seqlens_cpu.copy_(self.cache_seqlens_cuda, non_blocking=use_non_blocking)
+            self.q_in_cpu.copy_(query_states, non_blocking=True)
+            self.k_in_cpu.copy_(key_states, non_blocking=True)
+            self.v_in_cpu.copy_(value_states, non_blocking=True)
+            self.cache_seqlens_cpu.copy_(self.cache_seqlens_cuda, non_blocking=True)
             #            print(layer_idx)
             if layer_idx < self.dense_layer_num:
-                self.block_table_cpu.copy_(self.prefix_block_table, non_blocking=use_non_blocking)
-                if torch.cuda.is_available():
-                    self.cpu_infer.submit_with_cuda_stream(
-                        torch.cuda.current_stream().cuda_stream,
-                        self.local_thread.attn_with_kvcache(
-                            q_in=self.q_in_cpu,
-                            k_in=self.k_in_cpu,
-                            v_in=self.v_in_cpu,
-                            output=self.output_cpu,
-                            attn_lse=self.lse_cpu,
-                            layer_idx=layer_idx,
-                            block_table=self.block_table_cpu,
-                            cache_seqlens=self.cache_seqlens_cpu,
-                        ),
-                    )
-                else:
-                    self.cpu_infer.submit(
-                        self.local_thread.attn_with_kvcache(
-                            q_in=self.q_in_cpu,
-                            k_in=self.k_in_cpu,
-                            v_in=self.v_in_cpu,
-                            output=self.output_cpu,
-                            attn_lse=self.lse_cpu,
-                            layer_idx=layer_idx,
-                            block_table=self.block_table_cpu,
-                            cache_seqlens=self.cache_seqlens_cpu,
-                        )
-                    )
+                self.block_table_cpu.copy_(self.prefix_block_table, non_blocking=True)
+                self.cpu_infer.submit_with_cuda_stream(
+                    torch.cuda.current_stream("cpu").cuda_stream,
+                    self.local_thread.attn_with_kvcache(
+                        q_in=self.q_in_cpu,
+                        k_in=self.k_in_cpu,
+                        v_in=self.v_in_cpu,
+                        output=self.output_cpu,
+                        attn_lse=self.lse_cpu,
+                        layer_idx=layer_idx,
+                        block_table=self.block_table_cpu,
+                        cache_seqlens=self.cache_seqlens_cpu,
+                    ),
+                )
             else:
                 if self.preselect_block:
                     self.cache_seqlens_cpu.copy_(
-                        self.cache_seqlens_cuda - self.evict_tokens, non_blocking=use_non_blocking
+                        self.cache_seqlens_cuda - self.evict_tokens, non_blocking=True
                     )
                     if self.preselect_block_count < self.prefill_block_num:
                         self.block_table_cpu[:, : self.preselect_block_count].copy_(
                             self.preselect_block_table[layer_idx : layer_idx + 1],
-                            non_blocking=use_non_blocking,
+                            non_blocking=True,
                         )
 
                         self.block_table_cpu[
@@ -868,64 +708,56 @@ class DynamicScaledDotProductAttention:
                                 self.prefill_block_num : self.prefill_block_num
                                 + self.local_block_num,
                             ],
-                            non_blocking=use_non_blocking,
+                            non_blocking=True,
                         )
                     #                   print("submit_with_cuda_stream")
-                    if torch.cuda.is_available():
-                        self.cpu_infer.submit_with_cuda_stream(
-                            torch.cuda.current_stream().cuda_stream,
-                            self.local_thread.attn_with_kvcache(
-                                q_in=self.q_in_cpu,
-                                k_in=self.k_in_cpu,
-                                v_in=self.v_in_cpu,
-                                output=self.output_cpu,
-                                attn_lse=self.lse_cpu,
-                                layer_idx=layer_idx,
-                                generate_token_idx=self.generate_token_idx,
-                                block_table=self.block_table_cpu,
-                                cache_seqlens=self.cache_seqlens_cpu,
-                                topk=(
-                                    self.topk
-                                    if self.topk <= self.preselect_block_count
-                                    else None
-                                ),
-                                local=self.local_windows_len // self.block_size,
+                    self.cpu_infer.submit_with_cuda_stream(
+                        torch.cuda.current_stream("cpu").cuda_stream,
+                        self.local_thread.attn_with_kvcache(
+                            q_in=self.q_in_cpu,
+                            k_in=self.k_in_cpu,
+                            v_in=self.v_in_cpu,
+                            output=self.output_cpu,
+                            attn_lse=self.lse_cpu,
+                            layer_idx=layer_idx,
+                            generate_token_idx=self.generate_token_idx,
+                            block_table=self.block_table_cpu,
+                            cache_seqlens=self.cache_seqlens_cpu,
+                            topk=(
+                                self.topk
+                                if self.topk <= self.preselect_block_count
+                                else None
                             ),
-                        )
-                    else:
-                        # 在CUDA不可用时使用普通submit
-                        self.cpu_infer.submit(
-                            self.local_thread.attn_with_kvcache(
-                                q_in=self.q_in_cpu,
-                                k_in=self.k_in_cpu,
-                                v_in=self.v_in_cpu,
-                                output=self.output_cpu,
-                                attn_lse=self.lse_cpu,
-                                layer_idx=layer_idx,
-                                generate_token_idx=self.generate_token_idx,
-                                block_table=self.block_table_cpu,
-                                cache_seqlens=self.cache_seqlens_cpu,
-                                topk=(
-                                    self.topk
-                                    if self.topk <= self.preselect_block_count
-                                    else None
-                                ),
-                                local=self.local_windows_len // self.block_size,
-                            )
-                        )
-                #                    print("submit_with_cuda_stream enqueue\n")
-                # 同步CPU和CUDA操作
-                if torch.cuda.is_available():
-                    self.cpu_infer.sync_with_cuda_stream(
-                        torch.cuda.current_stream().cuda_stream
+                            local=self.local_windows_len // self.block_size,
+                        ),
                     )
+                #                    print("submit_with_cuda_stream enqueue\n")
                 else:
-                    self.cpu_infer.sync()
-                #            print("submit_with_cuda_stream finished\n")
-                self.output_cuda.copy_(self.output_cpu, non_blocking=use_non_blocking)
-                # 强制内存连续
-                self.output_cuda = self.output_cuda.contiguous()
-                return self.output_cuda.transpose(1, 2)
+                    self.block_table_cpu.copy_(
+                        self.prefix_block_table, non_blocking=True
+                    )
+                    self.cpu_infer.submit_with_cuda_stream(
+                        torch.cuda.current_stream("cpu").cuda_stream,
+                        self.local_thread.attn_with_kvcache(
+                            q_in=self.q_in_cpu,
+                            k_in=self.k_in_cpu,
+                            v_in=self.v_in_cpu,
+                            output=self.output_cpu,
+                            attn_lse=self.lse_cpu,
+                            layer_idx=layer_idx,
+                            generate_token_idx=self.generate_token_idx,
+                            block_table=self.block_table_cpu,
+                            cache_seqlens=self.cache_seqlens_cpu,
+                            topk=self.topk,
+                            local=self.local_windows_len // self.block_size,
+                        ),
+                    )
+            self.cpu_infer.sync_with_cuda_stream(
+                torch.cuda.current_stream("cpu").cuda_stream
+            )
+            #            print("submit_with_cuda_stream finished\n")
+            self.output_cuda.copy_(self.output_cpu, non_blocking=True)
+            return self.output_cuda.transpose(1, 2)
 
     def save(self, path: str, length: int):
         cur_block_num = (length + self.block_size - 1) // self.block_size
@@ -947,10 +779,3 @@ class DynamicScaledDotProductAttention:
             )
         )
         self.cpu_infer.sync()
-
-    def test_gradient(self, query, key, value):
-        # 梯度检查
-        torch.autograd.gradcheck(fn, (query, key, value), eps=1e-3, atol=1e-2)
-
-        # 数值精度验证
-        assert torch.allclose(orig_output, amx_output, atol=1e-3), "Numerical mismatch!"

@@ -9,16 +9,13 @@ from ktransformers.operators.triton_attention import decode_attention_fwd_groupe
 
 flashinfer_enabled = False
 
-if torch.cuda.is_available():
-    try:
-        import flashinfer
-        flashinfer_enabled = True
-        print("found flashinfer")
-        
-    except ImportError:
-        print("flashinfer not found, use triton for linux")
-else:
-    print("CUDA not available, skipping flashinfer import")
+try:
+    import flashinfer
+    flashinfer_enabled = True
+    print("found flashinfer")
+    
+except ImportError:
+    print("flashinfer not found, use triton for linux")
 
 import math
 

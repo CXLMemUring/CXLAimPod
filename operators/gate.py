@@ -6,7 +6,7 @@ import os
 from ktransformers.operators.base_operator import BaseInjectedModule
 from ktransformers.operators.base_operator import BaseInjectedModule
 from ktransformers.operators.linear import KTransformersLinear
-from ktransformers.util.custom_gguf import GGUFLoader
+from ktransformers.util.custom_gguf import GGUFLoader, SafeTensorLoader
 from transformers.configuration_utils import PretrainedConfig
 from abc import ABC, abstractmethod
 
@@ -55,24 +55,33 @@ class KMoEGateBase(ABC):
         down_type = None
 
         for key in keys:
-            key = ".".join(key.split(".")[:-1])
-            if self.gguf_loader.safetensor_loader is not None:
-                targets = [".ffn_gate_inp.weight", ".exp_probs_b.bias"]
-                weight = self.gguf_loader.safetensor_loader.load_tensor(key + ".ffn_gate_inp.weight") 
-                e_score_correction_bias = self.gguf_loader.safetensor_loader.load_tensor(key + ".exp_probs_b.bias")
-                weight_type = weight.dtype
-                e_score_correction_bias_type = e_score_correction_bias.dtype
-                res = {"weight": weight, "e_score_correction_bias": e_score_correction_bias,  "weight_type": weight_type, "e_score_correction_bias_type": e_score_correction_bias_type}
-            elif key + ".ffn_gate_inp.weight" in self.gguf_loader.tensor_info:
-                targets = [".ffn_gate_inp.weight", ".exp_probs_b.bias"]
-                tensors = self.load_multi(key, targets, device=device)
-                weight = tensors[".ffn_gate_inp.weight"]
-                e_score_correction_bias = tensors[".exp_probs_b.bias"]
-                weight_type = self.gguf_loader.tensor_info[key + ".ffn_gate_inp.weight"]["ggml_type"]
-                e_score_correction_bias_type = self.gguf_loader.tensor_info[key + ".exp_probs_b.bias"]["ggml_type"]
+            # key = ".".join(key.split(".")[:-1])
+            if isinstance(self.gguf_loader, SafeTensorLoader):
+                res = self.gguf_loader.load_gate(key, device=device)
             else:
-                raise ValueError(f"Experts {key} not found in gguf_loader")
-            res = {"weight": weight, "e_score_correction_bias": e_score_correction_bias,  "weight_type": weight_type, "e_score_correction_bias_type": e_score_correction_bias_type}
+                # For GGUF, translate the key
+                from ktransformers.util.custom_gguf import translate_name_to_gguf
+                translated_key = translate_name_to_gguf(key)
+                
+            if self.gguf_loader.has_tensor(translated_key+".weight"):
+                # Try to load weight
+                weight = self.gguf_loader.load_gguf_tensor(translated_key + ".weight", device=device)
+                
+                # Try to find bias - it might be at a different location
+                # Check for exp_probs_b.bias at the layer level
+                layer_key = translated_key.rsplit('.', 1)[0]  # Get blk.3 from blk.3.ffn_gate_inp
+                bias_key = layer_key + ".exp_probs_b.bias"
+                
+                if self.gguf_loader.has_tensor(bias_key):
+                    e_score_correction_bias = self.gguf_loader.load_gguf_tensor(bias_key, device=device)
+                else:
+                    # Try other possible bias locations
+                    e_score_correction_bias = None
+                    
+                res = {"weight": weight, "e_score_correction_bias": e_score_correction_bias}
+            else:
+                raise ValueError(f"Gate weights {key} not found in gguf_loader (translated: {translated_key})")
+
         return res
     
     def load_multi(self, key: str, keys: list[str], device: str = "cpu"):
@@ -93,8 +102,8 @@ class KMoEGate(BaseInjectedModule, KMoEGateBase):
         prefill_device: str = "cpu",
         **kwargs,
     ):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
-        KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
+        KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
         self.generate_device = generate_device
         self.prefill_device = prefill_device
 
@@ -106,8 +115,6 @@ class KMoEGate(BaseInjectedModule, KMoEGateBase):
         if w is None: w = self.load_weights(device=device)
         
         if isinstance(w, dict):
-            self.weight_type = w["weight_type"]
-            self.e_score_correction_bias_type = w["e_score_correction_bias_type"]
             self.orig_module.weight = nn.Parameter(w["weight"])
             self.orig_module.e_score_correction_bias = nn.Parameter(w["e_score_correction_bias"])
         else:
@@ -136,7 +143,7 @@ class KMoEGateQwen2Moe(BaseInjectedModule, KMoEGateBase):
         use_quant: bool = False,
         **kwargs,
     ):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
         KMoEGateBase.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
         self.generate_device = generate_device
         self.prefill_device = prefill_device
@@ -175,8 +182,6 @@ class KMoEGateQwen2Moe(BaseInjectedModule, KMoEGateBase):
         if w is None: w = self.load_weights(device=device)
         
         if isinstance(w, dict):
-            self.weight_type = w["weight_type"]
-            self.e_score_correction_bias_type = w["e_score_correction_bias_type"]
             self.orig_module.weight = nn.Parameter(w["weight"])
             self.orig_module.e_score_correction_bias = nn.Parameter(w["e_score_correction_bias"])
         else:
@@ -191,3 +196,34 @@ class KMoEGateQwen2Moe(BaseInjectedModule, KMoEGateBase):
             self.weight = None
         if self.e_score_correction_bias is not None:
             self.e_score_correction_bias = None
+
+
+class KMoEGateIPEXLLM(KMoEGate):
+    def __init__(
+        self,
+        key: str,
+        gguf_loader: GGUFLoader,
+        config: PretrainedConfig,
+        orig_module: nn.Module = None,
+        generate_device: str = "xpu",
+        prefill_device: str = "xpu",
+        **kwargs,
+    ):
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
+        KMoEGate.__init__(self, key, gguf_loader, config, orig_module, generate_device, **kwargs)
+        self.generate_device = generate_device
+        self.prefill_device = prefill_device
+
+    def forward(self, hidden_states) -> torch.Tensor:
+        x = hidden_states.view(-1, hidden_states.size(-1))
+        logits = torch.nn.functional.linear(
+            x.type(torch.float32), self.orig_module.weight.type(torch.float32), None
+        )
+        scores = logits.sigmoid()
+
+        from ipex_llm.transformers.models.common import moe_group_topk
+        topk_idx, topk_weight = moe_group_topk(scores, self.orig_module.e_score_correction_bias,
+                                               self.n_group, self.topk_group, self.top_k,
+                                               self.norm_topk_prob, self.routed_scaling_factor)
+        return topk_idx, topk_weight.to(x.dtype)
+

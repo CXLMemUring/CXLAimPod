@@ -66,7 +66,7 @@ class StaticCache(transformers.StaticCache):
             self.page_table_list = []
             for idx in range(config.num_hidden_layers):
                 if isinstance(device, dict):
-                    target_device = device[f"blk.{idx}.self_attn"]["generate_device"]
+                    target_device = device[f"model.layers.{idx}.self_attn"]["generate_device"]
                 else:
                     target_device = device
                 
@@ -91,7 +91,7 @@ class StaticCache(transformers.StaticCache):
             # Note: `mark_static_address` is used to tag the cache as an fixed data pointer, preventing cuda graph
             # breaks when updating the cache.
             if isinstance(device, dict):
-                target_device = device[f"blk.{idx}.self_attn"]["generate_device"]
+                target_device = device[f"model.layers.{idx}.self_attn"]["generate_device"]
             else:
                 target_device = device
             
@@ -143,12 +143,12 @@ class StaticCache(transformers.StaticCache):
             page_idx = cache_position // self.page_size
             page_offset = cache_position % self.page_size
             # key shape (self.max_pages, self.page_size, 1, config.kv_lora_rank + config.qk_rope_head_dim)
-            k_out[page_idx, page_offset, :, :self.kv_lora_rank] = key_states.to(k_out.dtype)
-            k_out[page_idx, page_offset, :, self.kv_lora_rank:] = value_states.to(k_out.dtype)
+            k_out[page_idx, page_offset, :, :self.kv_lora_rank] = key_states
+            k_out[page_idx, page_offset, :, self.kv_lora_rank:] = value_states
             return k_out, self.page_table_list[layer_idx]
         else:
-            k_out[:, :, cache_position] = key_states.to(k_out.dtype)
-            v_out[:, :, cache_position] = value_states.to(v_out.dtype)
+            k_out[:, :, cache_position] = key_states
+            v_out[:, :, cache_position] = value_states
             return k_out, v_out
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
@@ -194,21 +194,6 @@ class StaticCache(transformers.StaticCache):
         """Returns the maximum shape of the cache."""
         return self.max_cache_len
 
-    def get_layer_cache(self, layer_idx: int):
-        """
-        Returns the key and value cache for a specific layer.
-        
-        Parameters:
-            layer_idx (`int`): The index of the layer to get the cache for.
-            
-        Returns:
-            A tuple containing the key and value cache for the specified layer.
-        """
-        if self.is_MLA:
-            return self.key_cache[layer_idx], self.page_table_list[layer_idx]
-        else:
-            return self.key_cache[layer_idx], self.value_cache[layer_idx]
-
 class KDeepSeekV3Cache(nn.Module):
     def __init__(
         self,
@@ -228,7 +213,12 @@ class KDeepSeekV3Cache(nn.Module):
         self.v_caches = []
         
 
-    def load(self): 
+    def load(self, inference_context: "sched_ext.InferenceContext"):
+        
+        for i in range(self.config.num_hidden_layers):
+            self.k_caches.append(
+                inference_context.k_cache[0][i] 
+            )
         self.max_cache_len = self.k_caches[0].shape[0]*self.k_caches[0].shape[1]
 
     def update(
@@ -303,8 +293,15 @@ class KGQACache(nn.Module):
         self.v_caches = []
         
 
-    def load(self): 
+    def load(self, inference_context: "sched_ext.InferenceContext"):
         print(self.config.num_hidden_layers)
+        for i in range(self.config.num_hidden_layers):
+            self.k_caches.append(
+                inference_context.k_cache[0][i] 
+            )
+            self.v_caches.append(
+                inference_context.v_cache[0][i]
+            )
 
 
         self.max_cache_len = self.k_caches[0].shape[0]*self.k_caches[0].shape[1]

@@ -45,23 +45,8 @@ class CPUInferKVCache:
         max_batch_size: int = 4,
         max_block_num: int = 512,
     ):
-        # 确保所有参数都有有效值
-        layer_num = int(layer_num) if layer_num is not None else 32
-        kv_head_num = int(kv_head_num) if kv_head_num is not None else 8
-        q_head_num = int(q_head_num) if q_head_num is not None else 32
-        head_dim = int(head_dim) if head_dim is not None else 128
-        block_len = int(block_len) if block_len is not None else 256
-        anchor_num = int(anchor_num) if anchor_num is not None else 4
-        layer_step = int(layer_step) if layer_step is not None else 1
-        token_step = int(token_step) if token_step is not None else 1
-        layer_offset = int(layer_offset) if layer_offset is not None else 0
-        max_thread_num = int(max_thread_num) if max_thread_num is not None else 32
-        max_batch_size = int(max_batch_size) if max_batch_size is not None else 4
-        max_block_num = int(max_block_num) if max_block_num is not None else 512
-        
-        if anchor_type == "token":
-            anchor_type = "DYNAMIC"
-        elif anchor_type == "FIXED":
+
+        if anchor_type == "FIXED":
             anchor_type = cpuinfer_ext.kvcache.AnchorType.FIXED
         elif anchor_type == "QUEST":
             anchor_type = cpuinfer_ext.kvcache.AnchorType.QUEST
@@ -92,8 +77,6 @@ class CPUInferKVCache:
             retrieval_type = cpuinfer_ext.kvcache.RetrievalType.QHEAD
         elif retrieval_type == "SEPARATE":
             retrieval_type = cpuinfer_ext.kvcache.RetrievalType.KVHEAD
-        elif retrieval_type == "count":
-            retrieval_type = cpuinfer_ext.kvcache.RetrievalType.LAYER
 
         self.config = cpuinfer_ext.kvcache.KVCacheConfig(
             layer_num,

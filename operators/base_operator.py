@@ -6,7 +6,7 @@ Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
 '''
 from typing import Any
 from torch import nn, Tensor
-from ktransformers.util.custom_gguf import GGUFLoader
+from ktransformers.util.weight_loader import GGUFLoader
 from transformers.configuration_utils import PretrainedConfig
 import ktransformers.util.utils as utils
 class BaseInjectedModule(nn.Module):
@@ -16,16 +16,17 @@ class BaseInjectedModule(nn.Module):
                  gguf_loader : GGUFLoader,
                  config: PretrainedConfig,
                  orig_module: nn.Module,
-                 device: str,
+                 prefill_device: str = "cpu",
+                 generate_device: str = "cpu",
                  **kwargs):
         nn.Module.__init__(self)
         nn.Module.__setattr__(self, "orig_module", orig_module)
         object.__setattr__(self, "key", key)
         object.__setattr__(self, "gguf_loader", gguf_loader)
         object.__setattr__(self, "config", config)
-        object.__setattr__(self, "prefill_device", device)
-        object.__setattr__(self, "generate_device", device)
-        object.__setattr__(self, "device", device)
+        object.__setattr__(self, "prefill_device", prefill_device)
+        object.__setattr__(self, "generate_device", generate_device)
+        object.__setattr__(self, "device", generate_device)
         
     def __getattr__(self, name: str) -> Any:
         # __getattr__ in nn.Module doesn't call super().__getattribute__ when name is not in nn.Module.__dict__,

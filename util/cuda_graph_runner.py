@@ -32,6 +32,8 @@ class CUDAGraphRunner:
         self.model = model
         inputs_embeds = model.model.embed_tokens(cur_token.to("cpu")).to(main_device)
         # torch.cuda.set_device can't set "cpu", must have a index
+        if main_device == "cpu":
+            main_device = "cpu"
         torch.cuda.set_device(main_device)
         self.main_device = main_device
         capture_stream = torch.cuda.Stream()

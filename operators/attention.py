@@ -8,12 +8,12 @@ import torch
 from torch import nn
 import warnings
 import torch.nn.functional as F
-import math
 from ktransformers.operators.models import KLlamaModel
 from ktransformers.models.configuration_deepseek import DeepseekV2Config
 from ktransformers.models.configuration_llama import LlamaConfig
 from ktransformers.models.modeling_llama import LlamaRotaryEmbedding
 from ktransformers.models.modeling_deepseek import DeepseekV2Attention, apply_rotary_pos_emb
+from ktransformers.models.modeling_qwen3_moe import Qwen3MoeAttention
 from typing import Optional, Tuple
 from ktransformers.operators.base_operator import BaseInjectedModule
 from ktransformers.util.custom_gguf import GGUFLoader
@@ -31,7 +31,7 @@ from ktransformers.operators.triton_attention import decode_attention_fwd_groupe
 from ktransformers.operators.triton_attention_prefill import context_attention_fwd
 import os
 from ktransformers.operators.flashinfer_wrapper import flashinfer_enabled
-if flashinfer_enabled and torch.cuda.is_available():
+if flashinfer_enabled:
     from ktransformers.operators.flashinfer_wrapper import MLAWrapperSingleton
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from ktransformers.models.custom_cache import KDeepSeekV3Cache
@@ -58,9 +58,8 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                  generate_device: str = "cpu",
                  chunck_size: int = 1000,
                  absorb_for_prefill: bool = False,
-                 device: str = "cpu",
                  **kwargs):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device,  **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
         self.orig_module.__init__(orig_module.config,
             orig_module.layer_idx)
         self.chunck_size = chunck_size # TODO, generate chunck_size automatically.
@@ -126,9 +125,19 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             k_pe = k_pe.transpose(1,2)
             compressed_kv = compressed_kv.unsqueeze(2)
             compressed_kv_with_k_pe, _ = past_key_value.update(compressed_kv, k_pe, self.layer_idx, cache_kwargs)
-            compressed_kv, k_pe = torch.split(
-                compressed_kv_with_k_pe, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-            )
+            
+            # Check if the cache returned the expected dimensions
+            if compressed_kv_with_k_pe.shape[-1] == self.kv_lora_rank:
+                # Cache only returned compressed_kv, not concatenated with k_pe
+                compressed_kv = compressed_kv_with_k_pe
+                # k_pe remains as it was before the update
+            elif compressed_kv_with_k_pe.shape[-1] == self.kv_lora_rank + self.qk_rope_head_dim:
+                # Cache returned concatenated tensor, split it
+                compressed_kv, k_pe = torch.split(
+                    compressed_kv_with_k_pe, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+                )
+            else:
+                raise ValueError(f"Unexpected cache output dimension: {compressed_kv_with_k_pe.shape[-1]}, expected {self.kv_lora_rank} or {self.kv_lora_rank + self.qk_rope_head_dim}")
             # k_pe [pages, page_size, 1, self.qk_rope_head_dim]
             # compressed_kv [pages, page_size, 1, self.kv_lora_rank]
             
@@ -140,68 +149,17 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         compressed_kv = compressed_kv.view(bsz, 1, -1, self.kv_lora_rank)[:,:,:attention_mask.size(-1),:]
         # k_pe [bsz, 1, cache_len, self.qk_rope_head_dim]
         # compressed_kv [bsz, 1, cache_len,self.kv_lora_rank]
-        q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype))
         
-        # Add safety checks for tensor shapes
-        try:
-            if q_pe.shape[-2] != k_pe.shape[-2]:
-                # print(f"Shape mismatch in attention: q_pe shape {q_pe.shape}, k_pe shape {k_pe.shape}")
-                # Adjust shapes to be compatible
-                min_len = min(q_pe.shape[-2], k_pe.shape[-2])
-                q_pe = q_pe[:, :, :min_len, :]
-                k_pe = k_pe[:, :, :min_len, :]
-            
-            if q_nope.shape[-2] != compressed_kv.shape[-2]:
-                # print(f"Shape mismatch in attention: q_nope shape {q_nope.shape}, compressed_kv shape {compressed_kv.shape}")
-                # Adjust shapes to be compatible
-                min_len = min(q_nope.shape[-2], compressed_kv.shape[-2])
-                q_nope = q_nope[:, :, :min_len, :]
-                compressed_kv = compressed_kv[:, :, :min_len, :]
-                
-            # Ensure attention_mask has the right shape
-            if attention_mask is not None and attention_mask.shape[-1] != k_pe.shape[-2]:
-                # print(f"Attention mask shape mismatch: {attention_mask.shape}, k_pe shape: {k_pe.shape}")
-                # Resize attention mask to match
-                if attention_mask.shape[-1] > k_pe.shape[-2]:
-                    attention_mask = attention_mask[:, :, :, :k_pe.shape[-2]]
-                else:
-                    # Pad with large negative values to mask out additional positions
-                    pad_size = k_pe.shape[-2] - attention_mask.shape[-1]
-                    padding = torch.full((attention_mask.shape[0], attention_mask.shape[1], attention_mask.shape[2], pad_size), 
-                                          -10000.0, device=attention_mask.device, dtype=attention_mask.dtype)
-                    attention_mask = torch.cat([attention_mask, padding], dim=-1)
-            
-            # Ensure all tensors have the same dtype
-            q_pe_dtype = q_pe.dtype
-            attn_weights = (torch.matmul(q_pe, k_pe.mT.to(q_pe_dtype)) + torch.matmul(q_nope.to(q_pe_dtype), compressed_kv.mT.to(q_pe_dtype))) * self.softmax_scale
-        except RuntimeError as e:
-            print(f"Error in attention calculation: {e}")
-            print(f"q_pe shape: {q_pe.shape}, k_pe shape: {k_pe.shape}")
-            print(f"q_nope shape: {q_nope.shape}, compressed_kv shape: {compressed_kv.shape}")
-            # Attempt to reshape for compatibility
-            bsz, num_heads, q_len, _ = q_pe.shape
-            kv_seq_len = k_pe.shape[-2]
-            
-            # Reshape all tensors to ensure compatibility
-            reshaped_q_pe = q_pe.reshape(bsz * num_heads, q_len, -1)
-            reshaped_q_nope = q_nope.reshape(bsz * num_heads, q_len, -1)
-            
-            # Expand k_pe and compressed_kv to match the number of heads
-            expanded_k_pe = k_pe.expand(bsz, num_heads, kv_seq_len, -1)
-            expanded_compressed_kv = compressed_kv.expand(bsz, num_heads, kv_seq_len, -1)
-            
-            reshaped_k_pe = expanded_k_pe.reshape(bsz * num_heads, kv_seq_len, -1)
-            reshaped_compressed_kv = expanded_compressed_kv.reshape(bsz * num_heads, kv_seq_len, -1)
-            
-            # Compute attention weights with reshaped tensors (ensure same dtype)
-            pe_weights = torch.bmm(reshaped_q_pe, reshaped_k_pe.transpose(1, 2).to(reshaped_q_pe.dtype))
-            nope_weights = torch.bmm(reshaped_q_nope, reshaped_compressed_kv.transpose(1, 2).to(reshaped_q_nope.dtype))
-            
-            # Reshape back
-            pe_weights = pe_weights.reshape(bsz, num_heads, q_len, kv_seq_len)
-            nope_weights = nope_weights.reshape(bsz, num_heads, q_len, kv_seq_len)
-            
-            attn_weights = (pe_weights + nope_weights) * self.softmax_scale
+        # Update kv_seq_len to match the actual sliced dimensions
+        kv_seq_len = k_pe.shape[-2]
+        
+        q_nope = torch.matmul(q_nope, q_absorb)
+        #print(q_pe.shape)
+        #print(k_pe.shape)
+        #print(q_nope.shape)
+        #print(compressed_kv.shape)
+        
+        attn_weights = (torch.matmul(q_pe, k_pe.mT) + torch.matmul(q_nope, compressed_kv.mT)) * self.softmax_scale
         
         #attn_weights [bsz, self.num_heads, q_len, kv_seq_len]
         compressed_kv = compressed_kv.squeeze(1)
@@ -221,7 +179,12 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 )
             """
             #causal_mask = attention_mask[:, :, :, : kv_seq_len]
-            attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+            
+            # Slice attention mask to match the actual kv_seq_len
+            if attention_mask.shape[-1] != kv_seq_len:
+                attention_mask = attention_mask[:, :, :, :kv_seq_len]
+            
+            attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(
@@ -231,9 +194,9 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             attn_weights, p=self.attention_dropout, training=self.training
         )
         
-        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv.to(attn_weights.dtype))
+        attn_output = torch.einsum('bhql,blc->bhqc', attn_weights, compressed_kv)
         
-        attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype)) 
+        attn_output = torch.matmul(attn_output, out_absorb.mT) 
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.v_head_dim):
             raise ValueError(
@@ -307,7 +270,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
             q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype)) # batched MM
+            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
             q_nope = q_nope.transpose(1, 2)
             #assert q_nope.is_contiguous()
             
@@ -348,7 +311,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
             attn_output = attn_output.transpose(1, 2)
-            attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype))
+            attn_output = torch.matmul(attn_output, out_absorb.mT)
             attn_output = attn_output.transpose(1, 2)
             
             attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
@@ -461,7 +424,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # q_absorb [self.num_heads, self.qk_nope_head_dim, self.kv_lora_rank]
             q_absorb, out_absorb = self.get_absorbed()
             q_nope = q_nope.transpose(1, 2) # q_len is 1, no GPU overhead, same below
-            q_nope = torch.matmul(q_nope, q_absorb.to(q_nope.dtype)) # batched MM
+            q_nope = torch.matmul(q_nope, q_absorb) # batched MM
             q_nope = q_nope.transpose(1, 2)
             q_nope = q_nope.contiguous()
             #assert q_nope.is_contiguous()
@@ -525,7 +488,7 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
             # attn_output [bsz, q_len, self.num_heads, self.kv_lora_rank]
             # out_absorb [self.num_heads, self.v_head_dim, self.kv_lora_rank]
             attn_output = attn_output.transpose(1, 2) # [bsz, self.num_heads, q_len, self.kv_lora_rank]
-            attn_output = torch.matmul(attn_output, out_absorb.mT.to(attn_output.dtype)) # [bsz, self.num_heads, q_len, self.v_head_dim]
+            attn_output = torch.matmul(attn_output, out_absorb.mT) # [bsz, self.num_heads, q_len, self.v_head_dim]
             attn_output = attn_output.transpose(1, 2).contiguous() # [bsz, q_len, self.num_heads, self.kv_lora_rank]
             
             attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim) # [bsz, q_len, self.num_heads * self.v_head_dim]
@@ -644,6 +607,100 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
                 
         return attn_output, None, past_key_value
 
+    def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+        bsz, q_len, _ = hidden_states.size()
+
+        if self.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        query_states = q.view(bsz, q_len, self.num_heads, self.q_head_dim).transpose(1, 2)
+
+        compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv, k_pe = torch.split(
+            compressed_kv, [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
+        )
+        k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
+        kv = (
+            self.kv_b_proj(self.kv_a_layernorm(compressed_kv))
+            .view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+            .transpose(1, 2)
+        )
+
+        k_nope, value_states = torch.split(
+            kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+        )
+        kv_seq_len = value_states.shape[-2]
+        if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+
+        position_embeddings = kwargs.get("position_embeddings", None)
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            key_states = torch.cat(
+                [k_nope, k_pe.expand([-1, self.num_heads, -1, -1])],
+                dim=-1
+            )
+            from ipex_llm.transformers.models.common import rotary_two_with_cache_inplaced
+            rotary_two_with_cache_inplaced(query_states[:, :, :, self.qk_nope_head_dim :],
+                                           key_states[:, :, :, self.qk_nope_head_dim:],
+                                           cos, sin, True)
+        else:
+            q_nope, q_pe = torch.split(
+                query_states, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            cos, sin = self.rotary_emb(q_pe, position_ids)
+            q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+            query_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+            query_states[:, :, :, : self.qk_nope_head_dim] = q_nope
+            query_states[:, :, :, self.qk_nope_head_dim :] = q_pe
+
+            key_states = k_pe.new_empty(bsz, self.num_heads, q_len, self.q_head_dim)
+            key_states[:, :, :, : self.qk_nope_head_dim] = k_nope
+            key_states[:, :, :, self.qk_nope_head_dim :] = k_pe
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(
+                key_states.half(), value_states.half(), self.layer_idx, cache_kwargs
+            )
+
+        attn_weights = None
+        from ipex_llm.transformers.models.common import scaled_dot_product_attention
+        attn_output = scaled_dot_product_attention(
+            query_states.half(), key_states, value_states,
+            attention_mask.half(), q_len == kv_seq_len, self.softmax_scale
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+        attn_output = self.o_proj(attn_output).to(hidden_states.dtype)
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -653,19 +710,23 @@ class KDeepseekV2Attention(BaseInjectedModule, DeepseekV2Attention):
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.45
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        # Helper function to match dtypes between input and weights
-        def _ensure_dtype_match(input_tensor, weight_tensor):
-            if input_tensor.dtype != weight_tensor.dtype:
-                input_tensor = input_tensor.to(dtype=weight_tensor.dtype)
-            return input_tensor
-
-        compute_capability = get_compute_capability()
-        if os.name == 'nt' or compute_capability is None or compute_capability < 8 or device_manager.gpu_vendor != GPUVendor.NVIDIA:
+        if torch.xpu.is_available():
+            return self.forward_xpu(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                past_key_value,
+                output_attentions,
+                use_cache,
+                cache_position,
+                **kwargs,
+            )
+        elif (os.name == 'nt'
+              or get_compute_capability() < 8
+              or hidden_states.device.type == 'cpu'
+              or device_manager.gpu_vendor != GPUVendor.NVIDIA):
             return self.forward_windows(
                 hidden_states,
                 attention_mask,
@@ -712,7 +773,7 @@ class KLlamaAttention(BaseInjectedModule):
                  prefill_device: str = "cpu",
                  generate_device: str = "cpu",
                  **kwargs):
-        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, **kwargs)
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, generate_device, **kwargs)
         self.orig_module.__init__(orig_module.config,
             orig_module.layer_idx)
     def apply_rotary_pos_emb(self, q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
@@ -754,188 +815,150 @@ class KLlamaAttention(BaseInjectedModule):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
-        # Helper function to match dtypes between input and weights
-        def _ensure_dtype_match(input_tensor, weight_tensor):
-            if input_tensor.dtype != weight_tensor.dtype:
-                input_tensor = input_tensor.to(dtype=weight_tensor.dtype)
-            return input_tensor
+        if self.config.pretraining_tp > 1:
+            key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
+            query_slices = self.q_proj.weight.split(
+                (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
+            )
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            query_states = torch.cat(query_states, dim=-1)
+
+            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+            key_states = torch.cat(key_states, dim=-1)
+
+            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
+            value_states = torch.cat(value_states, dim=-1)
+
+        else:
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        if position_embeddings is None:
+
+            logger.warning(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.45 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        if q_len == 1:
+            position_ids = position_ids[0][-1].unsqueeze(0).unsqueeze(0)
+            query_states = query_states[:, :, -1:]
+            key_states = key_states[:, :, -1:]
+
+        attn_output = KLlamaModel.dynamic_sdpa.apply(
+            self.layer_idx,
+            bsz,
+            position_ids[0][0],
+            query_states.transpose(1, 2).to(torch.float16),
+            key_states.transpose(1, 2).to(torch.float16),
+            value_states.transpose(1, 2).to(torch.float16),
+            mode="prefill" if q_len > 1 else "generate",
+        )
+
+
+        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+            raise ValueError(
+                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f" {attn_output.size()}"
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+
+        attn_output = attn_output.reshape(bsz, q_len, -1)
 
         if self.config.pretraining_tp > 1:
-            query_slicing = (self.num_heads * self.head_dim) // self.config.pretraining_tp
-            query_states = self.q_proj.forward(hidden_states)
-            key_states = self.k_proj.forward(hidden_states)
-            value_states = self.v_proj.forward(hidden_states)
-
-            query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-            key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-            value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
+            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
         else:
-            # Ensure hidden_states has same dtype as weight tensors before linear operations
-            try:
-                # Match dtype with weights before linear operations
-                hidden_states = _ensure_dtype_match(hidden_states, self.q_proj.weight)
-                query_states = self.q_proj(hidden_states)
-                key_states = self.k_proj(hidden_states)
-                value_states = self.v_proj(hidden_states)
+            attn_output = self.o_proj(attn_output)
 
-                query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-                key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-                value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-            except RuntimeError as e:
-                if "expected m1 and m2 to have the same dtype" in str(e):
-                    print(f"Handling dtype mismatch in attention forward: {e}")
-                    # Get the dtype from the weights
-                    weight_dtype = self.q_proj.weight.dtype
-                    
-                    # Convert hidden states to match weight dtype
-                    hidden_states = hidden_states.to(dtype=weight_dtype)
-                    
-                    # Retry linear operations with matched dtype
-                    query_states = self.q_proj(hidden_states)
-                    key_states = self.k_proj(hidden_states)
-                    value_states = self.v_proj(hidden_states)
-                    
-                    query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
-                    key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-                    value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-                else:
-                    raise
+        if not output_attentions:
+            attn_weights = None
 
-        # 将当前key和value与past_key_value中的在cuda端向量做拼接
-        is_prefill = False
+        return attn_output, attn_weights, past_key_value
+
+
+class KQwen3MoeAttentionIPEXLLM(BaseInjectedModule, Qwen3MoeAttention):
+    def __init__(self,
+                 key: str,
+                 gguf_loader : GGUFLoader,
+                 config: PretrainedConfig,
+                 orig_module: nn.Module,
+                 prefill_device: str = "xpu",
+                 generate_device: str = "xpu",
+                 chunck_size: int = 1000,
+                 **kwargs):
+        BaseInjectedModule.__init__(self, key, gguf_loader, config, orig_module, prefill_device, **kwargs)
+        self.orig_module.__init__(orig_module.config,
+            orig_module.layer_idx)
+        self.chunck_size = chunck_size # TODO, generate chunck_size automatically.
+        assert prefill_device.lower()[:3] == "xpu", "KQwen3MoeAttentionIPEXLLM only supports XPU device"
+        assert generate_device.lower()[:3] == "xpu", "KQwen3MoeAttentionIPEXLLM only supports XPU device"
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: Optional[torch.Tensor],
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor],
+        past_key_value: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        input_shape = hidden_states.shape[:-1]
+        bsz, q_len, _ = hidden_states.size()
+        input_dtype = hidden_states.dtype
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        if not hasattr(self, 'qkv_proj'):
+            from ipex_llm.transformers.models.common import merge_quantized_qkv
+            merge_quantized_qkv(self.q_proj.generate_linear, self.k_proj.generate_linear, self.v_proj.generate_linear, self.orig_module)
+
+        qkv = self.qkv_proj(hidden_states)
+        qkv = qkv.view(bsz, q_len, -1, self.head_dim)
+        qkv = qkv.transpose(1, 2)
+        query_states, key_states, value_states = qkv.split([self.config.num_attention_heads,
+                                                            self.config.num_key_value_heads,
+                                                            self.config.num_key_value_heads], dim=1)
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        if position_embeddings is None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        cos, sin = position_embeddings
+
+        from ipex_llm.transformers.models.common import rotary_half_with_cache_inplaced
+        rotary_half_with_cache_inplaced(query_states, key_states, cos, sin)
+
         if past_key_value is not None:
-            if not isinstance(past_key_value, StaticCache):
-                key_states = torch.cat([past_key_value[0], key_states], dim=1)
-                value_states = torch.cat([past_key_value[1], value_states], dim=1)
-                past_key_value = (key_states, value_states)
-            else:
-                # StaticCache update
-                past_key_value.update(key_states, value_states, self.layer_idx, {"cache_position": cache_position})
-                past_key, past_value = past_key_value.get_layer_cache(self.layer_idx)
-                past_value_is_None = (past_value is None)
-                if not past_value_is_None:
-                    is_prefill = q_len > 1
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_value.update(key_states.half(), value_states.half(),
+                                                             self.layer_idx, cache_kwargs)
 
-        # Prepare rotary embeddings
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        attn_weights = None
+        from ipex_llm.transformers.models.common import scaled_dot_product_attention
+        attn_output = scaled_dot_product_attention(
+            query_states.half(), key_states, value_states,
+            attention_mask.half(), q_len == key_states.size(2), self.scaling
+        )
+        attn_output = attn_output.transpose(1, 2).contiguous()
 
-        # Compute attention scores and values with position embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_value is not None and not is_prefill:
-            # CPU fallback implementation when using CPU device
-            try:
-                # Try to use the KLlamaModel.dynamic_sdpa method
-                if hasattr(KLlamaModel, 'dynamic_sdpa') and KLlamaModel.dynamic_sdpa is not None:
-                    attn_output = KLlamaModel.dynamic_sdpa.apply(
-                        self.layer_idx,
-                        bsz,
-                        position_ids[0][0],
-                        query_states.transpose(1, 2).to(torch.float32),  # Convert to float32 for CPU compatibility
-                        key_states.transpose(1, 2).to(torch.float32),    # Convert to float32 for CPU compatibility  
-                        value_states.transpose(1, 2).to(torch.float32),  # Convert to float32 for CPU compatibility
-                        mode="prefill" if q_len > 1 else "generate",
-                    )
-                else:
-                    raise AttributeError("dynamic_sdpa is not available")
-            except (AttributeError, RuntimeError) as e:
-                # Fallback to a simple CPU implementation if dynamic_sdpa is not available or fails
-                print(f"Falling back to basic CPU attention implementation: {str(e)}")
-                # Simple CPU fallback attention implementation
-                query_length = query_states.size(1)
-                key_length = key_states.size(1)
-                
-                # Convert all tensors to float32 for stability on CPU
-                query = query_states.to(dtype=torch.float32)
-                key = key_states.to(dtype=torch.float32)
-                value = value_states.to(dtype=torch.float32)
-                
-                # Reshape for attention computation
-                query = query.transpose(1, 2)  # [bsz, num_heads, query_length, head_dim]
-                key = key.transpose(1, 2)      # [bsz, num_kv_heads, key_length, head_dim]
-                value = value.transpose(1, 2)  # [bsz, num_kv_heads, key_length, head_dim]
-                
-                # Handle different number of heads in query and key/value
-                if self.num_key_value_heads != self.num_heads:
-                    # Repeat key and value if needed
-                    try:
-                        key = key.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
-                        value = value.repeat_interleave(self.num_heads // self.num_key_value_heads, dim=1)
-                    except RuntimeError as repeat_error:
-                        print(f"Error in repeat_interleave: {repeat_error}")
-                        # Handle case where head dimensions don't divide evenly
-                        # Simply broadcast to match query dimensions
-                        if key.size(1) != query.size(1):
-                            print(f"Reshaping key from {key.shape} to match query heads {query.shape}")
-                            # Alternate approach using expand
-                            key_expanded = key.unsqueeze(2).expand(-1, -1, self.num_heads // self.num_key_value_heads, -1, -1)
-                            key = key_expanded.reshape(bsz, self.num_heads, key_length, -1)
-                            
-                            value_expanded = value.unsqueeze(2).expand(-1, -1, self.num_heads // self.num_key_value_heads, -1, -1)
-                            value = value_expanded.reshape(bsz, self.num_heads, key_length, -1)
-                
-                try:
-                    # Compute attention
-                    attn_weights = torch.matmul(query, key.transpose(2, 3)) / math.sqrt(self.head_dim)
-                    
-                    # Apply causal mask
-                    if query_length > 1:  # In prefill mode
-                        causal_mask = torch.ones((query_length, key_length), dtype=torch.bool, device=query.device)
-                        causal_mask = torch.triu(causal_mask, diagonal=1)
-                        causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, query_length, key_length]
-                        attn_weights = attn_weights.masked_fill(causal_mask, float("-inf"))
-                    
-                    # Apply softmax
-                    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-                    
-                    # Apply attention to values
-                    attn_output = torch.matmul(attn_weights, value)  # [bsz, num_heads, query_length, head_dim]
-                except RuntimeError as matmul_error:
-                    print(f"Error in attention matrix operations: {matmul_error}")
-                    print(f"Query shape: {query.shape}, Key shape: {key.shape}, Value shape: {value.shape}")
-                    
-                    # Last resort fallback: just return the query as output
-                    # This won't produce correct results but will allow execution to continue
-                    attn_output = query
-                
-                # Reshape to original format
-                attn_output = attn_output.transpose(1, 2).contiguous()  # [bsz, query_length, num_heads, head_dim]
-        else:
-            # In prefill mode
-            past_key = None
-            past_value = None
-            page_table = None
-            if past_key_value is not None and not past_value_is_None:
-                past_key, past_value = past_key_value.get_layer_cache(self.layer_idx)
-                is_MLA = past_value is None
-                if is_MLA:
-                    is_page = isinstance(past_key_value, StaticCache) and hasattr(past_key_value, "is_page") and past_key_value.is_page
-                    if is_page:
-                        page_table = past_value
-                    else:
-                        past_key, page_table = past_key, None
-                else:
-                    past_key, past_value = past_key, past_value
-
-            # Compute attention with full matrices (prefill mode)
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-            if attention_mask is not None:
-                # Apply attention mask
-                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
-            
-            # Apply softmax
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
-            
-            # Apply attention to values
-            attn_output = torch.matmul(attn_weights, value_states)
-            
-            if output_attentions:
-                attn_weights = attn_weights
-
-        # Reshape attn_output to match the expected output shape
-        attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.head_dim)
-        
-        # Apply output projection
-        attn_output = self.o_proj(attn_output)
-
-        return attn_output, None, past_key_value
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output).to(input_dtype)
+        return attn_output, attn_weights
